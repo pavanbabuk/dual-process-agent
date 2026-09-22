@@ -139,7 +139,9 @@ dual-agent --gateway
 
 The gateway routes each Telegram chat to an isolated agent session with separate memory.
 
-Running the gateway also starts the **scheduler daemon**, which is what actually fires `/schedule` jobs — they do not run while only the shell or dashboard is open.
+Running the gateway also starts the **scheduler daemon** (ticking every 60s). The dashboard starts its own tick loop (every 20s) for as long as the UI is open, so `/schedule` jobs fire in either process; the interactive shell alone runs neither.
+
+**Scheduled job output goes to the console of whichever process runs it, and is never sent to a chat.** A job result is printed to stdout and its outcome recorded in `scheduled_jobs.last_status`; nothing is pushed to Telegram. `/api/schedules` returns `delivery: "stdout"` so the dashboard does not imply a notification that never arrives. Also, the dashboard has no terminal behind it, so a scheduled job that needs approval fails with `EOF when reading a line` — for unattended runs use `dual-agent gateway` with `DUAL_AGENT_AUTO_ALLOW_PERMISSIONS=true`.
 
 **Authorization is required.** The bot can write files and run shell commands on the machine hosting it, so it will only accept messages from ids listed in `TELEGRAM_ALLOWED_USER_IDS`. With that list empty, **every** message is rejected — the default is closed, not open. Set it before starting the daemon, and never leave a shell-capable bot reachable by whoever happens to find it.
 
@@ -171,10 +173,36 @@ pip install "dual-agent[screen]"
 - **macOS Permissions**: Requires macOS Screen Recording permission (for display capture) and Accessibility permission (in System Settings -> Privacy & Security -> Accessibility) for sending input events.
 
 ### Vision Models & Cost Prerequisite
-Text-only models (such as `deepseek-chat` or `deepseek-reasoner`) do not process images. To control visual screens, configure a multimodal vision model:
-- OpenAI (`gpt-4o`, `gpt-4o-mini`) via `OPENAI_API_KEY`
-- xAI Grok Vision (`grok-2-vision-1212`) via `GROK_API_KEY`
-- Local VLM (e.g. `llava`, `qwen2-vl` on Ollama/vLLM) via `VISION_PROVIDER=custom` and `CUSTOM_LLM_BASE_URL`
+
+**The screen agent is not free.** Screen control has two halves — actuation (which is local and costs nothing) and *sight* (which requires a multimodal model and does cost money or local hardware). Without the second half the agent is blind, and a blind run is reported as a failure rather than presented as an observation.
+
+**What was measured on this machine (2026-09-22), not assumed:**
+
+- A real capture on this machine returned **3420x2224** pixels. `get_display_geometry()` reported the logical size as **1710x1112**, giving a measured scale factor of **2.0**; the 2560x1664 logical figure and ≈1.336 scale recorded earlier in this project's notes did not reproduce in this run. The scale factor is read from the live display at capture time rather than assumed, which is why the two differ.
+- The provider configured here is `deepseek` / `deepseek-chat`, served as **`deepseek-flash`**. It is **not** text-only. It correctly named a solid red frame `Red`, a solid blue frame `Blue`, and a solid green frame `Green`; with no textual question at all it described the image in prose. The hard-coded "text-only" rejection that used to live in `DeepSeekProvider.generate_step` was therefore **stale for this endpoint** and has been removed: it discarded images the endpoint accepts and substituted canned text.
+- The same model answered **`White`** for a **pure black** frame. So it has a vision tower and it is **not reliable**: treat any single frame reading as evidence, never as ground truth. Verify with `screen_diff` after acting.
+- **No local VLM is installed.** Ports 11434 (Ollama), 1234 (LM Studio) and 8080 (vLLM) are all closed. A local VLM would remove the per-call cost but is not present here.
+- **Rate limits are real but were not where this repo said.** Direct calls to `api.deepseek.com` returned HTTP 200 on 12/12 consecutive vision requests — no 429. The 429s come from the **local OmniRoute proxy on `localhost:20128`**: requests first return `504 RATE_LIMIT_EXECUTION_TIMEOUT` (OmniRoute's own 15 s queue deadline, not an upstream timeout), then `429 model_cooldown` ("All credentials for model gemini-3.7-flash are cooling down", `reset_seconds: 56`). A 429 is a quota failure and is reported as one — it is never a screen reading.
+
+**Consequences, stated plainly:**
+
+1. A screen run needs either a **paid vision model** (OpenAI `gpt-4o`, xAI `grok-2-vision-1212`) or a **locally installed VLM** (Ollama `llava`/`qwen2-vl`, vLLM). Both are configuration work you have to do; neither is present by default.
+2. **Grid overlays do not eliminate misses.** `grid_overlay` is a Set-of-Mark coordinate aid: it measurably helps a vision model land near a target, and it does not guarantee a hit. Coordinate errors remain. Nothing here claims an accuracy figure, because none was measured.
+3. A run with vision disabled **aborts with a named precondition** instead of falling back to the mock. `get_vision_provider()` returns a `BlockedVisionProvider` carrying the specific unmet requirement, and the dispatcher stops the run on it. Canned text is never returned as a screen reading.
+4. Screenshots are **downscaled to a 1400 px long edge** before transmission (a 3420x2224 capture → 1400x910). The exact sent dimensions and byte size are recorded in `SystemTwoResponse.metadata["images_sent"]`, so cost is auditable per step instead of estimated.
+
+Configure a vision model:
+
+```bash
+# Hosted (paid)
+VISION_PROVIDER=openai  VISION_MODEL=gpt-4o                 VISION_API_KEY=sk-...   dual-agent --goal "..."
+VISION_PROVIDER=grok    VISION_MODEL=grok-2-vision-1212    VISION_API_KEY=xai-...  dual-agent --goal "..."
+
+# Local VLM (no per-call cost, requires the model to be pulled first)
+VISION_PROVIDER=custom  VISION_MODEL=qwen2-vl  VISION_BASE_URL=http://localhost:11434/v1 dual-agent --goal "..."
+```
+
+`DUAL_AGENT_VISION_ENABLED=1` (or `vision_enabled: true` in `~/.dual_agent/config.json`) is required for any of these to take effect.
 
 ---
 
@@ -232,4 +260,4 @@ ID  Description                           Cron        Runs  Last Run  Enabled
 pytest -v --cov=dual_agent --cov=bridges
 ```
 
-**121 passing** unit and integration tests on Python 3.11 and 3.14 — including regression tests for argument validation, shell-injection resistance, gateway authorization, telemetry honesty, `.env` loading, and stall detection.
+**353 passing** unit and integration tests on Python 3.11 — including regression tests for argument validation, shell-injection resistance, gateway authorization, telemetry honesty, `.env` loading, stall detection, and vision-provider honesty (multimodal request shape, downscale dimensions, 429 reporting) asserted against a real local HTTP server rather than a mock.

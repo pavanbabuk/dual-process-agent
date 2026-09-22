@@ -186,9 +186,15 @@ class CronScheduler:
                     enabled BOOLEAN DEFAULT 1,
                     last_run_at TEXT,
                     run_count INTEGER DEFAULT 0,
+                    last_status TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Databases created before last_status existed need the column added;
+            # without this, _run_job's UPDATE would fail on every existing install.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(scheduled_jobs)")}
+            if "last_status" not in cols:
+                conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN last_status TEXT")
             conn.commit()
 
     # ------------------------------------------------------------------
@@ -239,7 +245,7 @@ class CronScheduler:
 
     async def run_forever(self, interval_seconds: int = 60) -> None:
         """Main scheduler loop — call inside asyncio event loop from the daemon."""
-        logger.info("[Scheduler] Daemon loop started (interval=60s)")
+        logger.info(f"[Scheduler] Daemon loop started (interval={interval_seconds}s)")
         while True:
             try:
                 self._tick()
@@ -254,8 +260,13 @@ class CronScheduler:
         for job in jobs:
             if not job["enabled"]:
                 continue
-            if self._is_due(job["cron_expr"], job["last_run_at"], now):
-                self._run_job(job)
+            # A raise inside _run_job would abandon the remaining jobs in this
+            # pass, so contain it per job: one broken job must not starve the rest.
+            try:
+                if self._is_due(job["cron_expr"], job["last_run_at"], now):
+                    self._run_job(job)
+            except Exception as e:
+                logger.warning(f"[Scheduler] Job #{job.get('id')} tick error: {e}")
 
     def _is_due(self, cron_expr: str, last_run_at: Optional[str], now: datetime.datetime) -> bool:
         """Evaluate if cron expression is due at the given datetime."""
@@ -288,7 +299,12 @@ class CronScheduler:
             return False
 
     def _run_job(self, job: Dict[str, Any]) -> None:
-        """Dispatch a scheduled job to the agent."""
+        """Dispatch a scheduled job to the agent.
+
+        Output destination: this process's stdout/log. There is no chat transport
+        in the scheduler, so a job result is never pushed to a chat — see the
+        `delivery` field on /api/schedules. Do not imply otherwise in the UI.
+        """
         from rich.console import Console
         console = Console()
         job_id = job["id"]
@@ -296,20 +312,27 @@ class CronScheduler:
         logger.info(f"[Scheduler] Running job #{job_id}: {goal[:60]}")
         console.print(f"\n[bold magenta]⏰ Scheduled Job #{job_id}:[/bold magenta] {goal}")
 
+        status = "ok"
         try:
             if self.dispatcher_factory:
                 dispatcher = self.dispatcher_factory()
                 result = dispatcher.run(goal)
                 console.print(f"[dim]Job #{job_id} result: {result.final_output or 'Done'}[/dim]")
             else:
+                status = "skipped: no dispatcher configured"
                 console.print(f"[yellow]Job #{job_id}: No dispatcher configured — skipped.[/yellow]")
         except Exception as e:
+            status = f"error: {e}"
             logger.error(f"[Scheduler] Job #{job_id} failed: {e}")
         finally:
             now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            # Record the outcome so an operator can tell, after the fact, whether
+            # a job actually dispatched or failed silently. run_count alone
+            # cannot distinguish a successful run from a crashed one.
             with self.memory._get_connection() as conn:
                 conn.execute(
-                    "UPDATE scheduled_jobs SET last_run_at = ?, run_count = run_count + 1 WHERE id = ?",
-                    (now, job_id),
+                    "UPDATE scheduled_jobs SET last_run_at = ?, run_count = run_count + 1, "
+                    "last_status = ? WHERE id = ?",
+                    (now, status, job_id),
                 )
                 conn.commit()

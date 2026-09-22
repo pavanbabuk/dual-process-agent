@@ -42,6 +42,10 @@ from dual_agent.system_two import (
 from dual_agent.dispatcher import DualProcessDispatcher
 from dual_agent.typesafe_client import JevSystemOneClient, JevDecision
 
+# The OpenAI-compatible stub server lives with the vision tests. Imported rather
+# than duplicated so one real server definition backs both suites.
+from tests.test_vision_provider import StubVisionServer
+
 
 def test_screen_geometry_returns_valid_scaling():
     geom = get_display_geometry()
@@ -183,18 +187,49 @@ def test_mcp_host_screen_tools_registered():
         assert defn.risk_level == "low"
 
 
-def test_deepseek_rejects_multimodal_images_honestly():
-    provider = DeepSeekProvider(api_key="test_key")
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        img_path = f.name
-    try:
-        Image.new("RGB", (10, 10)).save(img_path)
+def test_deepseek_sends_images_rather_than_assuming_text_only(tmp_path):
+    """The old hard-coded text-only refusal is gone.
+
+    It asserted `deepseek-chat` cannot see. Measured 2026-09-22, the configured
+    endpoint IS vision-capable (image_url payloads returned HTTP 200, and solid
+    red/green frames were named Red/Green), so the refusal discarded images the
+    endpoint would have accepted and substituted canned text. This test pins the
+    replacement behaviour: the image is transmitted, and the endpoint decides.
+    """
+    img_path = str(tmp_path / "shot.png")
+    Image.new("RGB", (10, 10)).save(img_path)
+
+    with StubVisionServer() as server:
+        provider = DeepSeekProvider(api_key="test_key", base_url=server.base_url, model="deepseek-chat")
+        resp = provider.generate_step("What is on this screen?", images=[img_path])
+
+        # The image really went out, as a multimodal part.
+        assert len(server.captured) == 1
+        content = server.captured[0]["body"]["messages"][1]["content"]
+        assert isinstance(content, list)
+        assert [p["type"] for p in content] == ["text", "image_url"]
+        assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+        # And the endpoint's answer is reported, not fabricated.
+        assert resp.is_mock is False
+        assert resp.action == "mouse_click"
+
+
+def test_deepseek_reports_a_multimodal_rejection_when_the_endpoint_refuses(tmp_path):
+    """If an endpoint genuinely cannot see, its refusal is what gets reported."""
+    img_path = str(tmp_path / "shot.png")
+    Image.new("RGB", (10, 10)).save(img_path)
+
+    with StubVisionServer(
+        status=400,
+        error_body={"error": {"message": "You have uploaded an unsupported image format"}},
+    ) as server:
+        provider = DeepSeekProvider(api_key="test_key", base_url=server.base_url, model="deepseek-chat")
         resp = provider.generate_step("What is on this screen?", images=[img_path])
         assert resp.is_mock is True
-        assert "text-only" in resp.degraded_reason
-    finally:
-        if os.path.exists(img_path):
-            os.unlink(img_path)
+        assert "400" in resp.degraded_reason
+        # Not presented as an observation of the screen.
+        assert "unsupported image" in resp.degraded_reason
 
 
 def test_openai_compatible_multimodal_request():

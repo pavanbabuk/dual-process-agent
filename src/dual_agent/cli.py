@@ -158,7 +158,43 @@ ENVIRONMENT
   DUAL_AGENT_SCREEN_CONTROL=0              Kill switch: disable all mouse and
                                            keyboard actuation.
   DUAL_AGENT_SCREEN_LOOP=1                 Enable screen perception loop.
-  VISION_PROVIDER                          openai | grok | custom (paid/local VLM)
+
+SCREEN CONTROL REQUIRES A VISION MODEL (it is not free)
+  Actuation (`mouse_click`, `key_press`, `screen_diff`) is local and costs
+  nothing. Sight does not: it needs a multimodal model, and without one the
+  screen loop is blind and the run aborts naming that precondition instead of
+  falling back to the mock. The mock's canned text is never a screen reading.
+
+    DUAL_AGENT_VISION_ENABLED=1          Required for the settings below to
+                                        apply. Also vision_enabled: true in
+                                        ~/.dual_agent/config.json.
+    VISION_PROVIDER                      openai | grok | custom
+    VISION_MODEL                         e.g. gpt-4o, grok-2-vision-1212,
+                                        qwen2-vl for a local server
+    VISION_BASE_URL                      OpenAI-compatible endpoint
+    VISION_API_KEY                       Credential; not needed for localhost
+    VISION_MAX_DIMENSION                 Long-edge bound for a sent screenshot
+                                        (default 1400; 3420x2224 -> 1400x910)
+
+  Measured on this machine, 2026-09-22 — not assumed:
+    - No local VLM is installed. Ports 11434 (Ollama), 1234 (LM Studio) and
+      8080 (vLLM) are all closed.
+    - The configured deepseek-chat (served as deepseek-flash) IS vision-capable:
+      it named Red/Blue/Green for solid frames and described an image with no
+      textual question. The 'deepseek is text-only' note elsewhere in this repo
+      is stale. It answered 'White' for a pure black frame, so its readings are
+      evidence and not ground truth.
+    - Direct api.deepseek.com vision calls returned 200 on 12/12 attempts. The
+      429s seen here come from the local OmniRoute proxy on :20128
+      (504 RATE_LIMIT_EXECUTION_TIMEOUT, then 429 model_cooldown). A 429 is
+      always reported as a rate limit and never as a screen reading.
+    - Grid overlays help a model land near a target; they do not eliminate
+      coordinate misses. No accuracy figure is claimed anywhere.
+
+  A run therefore needs a paid vision model or a locally installed VLM.
+
+  VISION_PROVIDER / VISION_MODEL / VISION_BASE_URL are read when deliberately
+  set; config.json remains the source of truth otherwise.
   DUAL_AGENT_UI_FORCE_SIMULATION=true      Keep the dashboard on the offline stub.
   DUAL_AGENT_UI_ALLOW_PUBLIC_BIND=true     Allow a non-loopback dashboard bind.
   TELEGRAM_BOT_TOKEN                       Required by `gateway`.

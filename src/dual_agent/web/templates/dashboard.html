@@ -634,6 +634,7 @@
     <!-- Schedules -->
     <div class="sidebar-section">
       <div class="sidebar-title">Scheduled Jobs</div>
+      <div id="schedules-status" style="padding:0 16px 6px;color:var(--text-muted);font-size:11px;"></div>
       <div id="schedules-list">
         <div style="padding:8px 16px;color:var(--text-muted);font-size:12px;">Loading…</div>
       </div>
@@ -1262,7 +1263,7 @@ async function loadSidebar() {
     ]);
     renderStats(mem.stats);
     renderSkills(skills.skills);
-    renderSchedules(schedules.jobs);
+    renderSchedules(schedules.jobs, schedules);
     renderTools(tools.tools);
   } catch(e) { console.warn('Sidebar load error:', e); }
 }
@@ -1292,21 +1293,41 @@ function renderSkills(skills) {
   `).join('');
 }
 
-function renderSchedules(jobs) {
+function renderSchedules(jobs, meta) {
+  meta = meta || {};
   const el = document.getElementById('schedules-list');
+  const head = document.getElementById('schedules-status');
+
+  // Show whether a scheduler is actually ticking, and where output goes. The
+  // list alone once implied "scheduled" while nothing dispatched and nothing
+  // was ever delivered to a chat.
+  if (head) {
+    if (meta.scheduler_running) {
+      head.textContent = `Ticking every ${meta.tick_seconds}s. Output goes to the console (delivery: ${meta.delivery}); not sent to any chat.`;
+    } else {
+      head.textContent = 'No scheduler running — jobs will not fire.';
+    }
+    if (meta.last_tick_error) {
+      head.textContent += ` Last tick error: ${meta.last_tick_error}`;
+    }
+  }
+
   if (!jobs.length) {
     el.innerHTML = '<div style="padding:8px 16px;color:var(--text-muted);font-size:12px;">No jobs scheduled.</div>';
     return;
   }
-  el.innerHTML = jobs.slice(0, 5).map(j => `
+  el.innerHTML = jobs.slice(0, 5).map(j => {
+    const status = j.last_status || 'never run';
+    return `
     <div class="sidebar-item">
       <div class="item-icon">${j.enabled ? '⏰' : '⏸'}</div>
       <div>
         <div class="item-name">${escHtml(j.description.slice(0, 30))}</div>
-        <div class="item-sub">${escHtml(j.cron_expr)} · ${j.run_count} runs</div>
+        <div class="item-sub">${escHtml(j.cron_expr)} · ${j.run_count} runs · ${escHtml(status)}</div>
       </div>
     </div>
-  `).join('');
+  `;
+  }).join('');
 }
 
 function renderTools(tools) {

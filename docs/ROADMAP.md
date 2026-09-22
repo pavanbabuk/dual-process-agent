@@ -185,8 +185,12 @@ Scope:
 
 **Priority: third. This is the difference between "4 hardcoded tools" and an agent platform.**
 
-`MCPManager.attach_to_host` currently registers a placeholder. The `mcp` package is declared and
-never imported.
+**Resolved — the MCP client is now real.** `MCPManager.attach_to_host` spawns the configured
+server, performs the `initialize` handshake, calls `tools/list`, and registers each discovered
+tool with its real name and schema; calls are forwarded over JSON-RPC and return the server's
+actual result. The protocol is implemented directly rather than via the `mcp` SDK, which is
+declared but only needed for HTTP transport (`HAS_MCP` gates that path alone). See
+`docs/ARCHITECTURE.md` §6.2.
 
 Scope:
 
@@ -311,7 +315,7 @@ Deliberately last. Each is real work but none unblocks the others.
 | Item | Detail |
 |---|---|
 | Second gateway | A second `GatewayAdapter` (Discord or Slack) to prove the ABC is genuinely platform-agnostic. Handle non-text message types. |
-| Scheduler delivery | Send job results to a chat via the gateway; drop the stdout `Console` output. Tick the scheduler under `--ui` too. |
+| Scheduler delivery | Send job results to a chat via the gateway instead of the stdout `Console` (the dashboard tick loop now exists; delivery does not). |
 | Fuller cron | Lists, ranges and names in `_is_due`; or delegate to `croniter`. |
 | `USER.md` that is actually maintained | Derive preference facts automatically and use them in the System 2 prompt. |
 | Skill replay that fires | Make `find_matching_skill` a real fast path: a matched routine proposes its `tool_sequence` instead of one model-chosen tool. |

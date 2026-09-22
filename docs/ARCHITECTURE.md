@@ -327,18 +327,43 @@ failure never propagates out of the dispatcher loop.
 
 ### 6.2 The MCP story, accurately
 
-`MCPManager.attach_to_host` iterates `mcp_servers.json`, skips `disabled` entries, and registers
-**one placeholder tool per server** named `mcp_<name>_dispatch` whose handler is:
+**Resolved — this section previously described a placeholder, and is now a real client.**
 
-```python
-lambda args, n=name: f"Dispatched to external MCP server '{n}': {args}"
-```
+`MCPManager.attach_to_host` iterates `mcp_servers.json`, skips `disabled` entries, and for each
+server spawns a **real subprocess**, performs the MCP `initialize` handshake, sends
+`notifications/initialized`, calls `tools/list`, and registers **each discovered tool under its
+real name, description and `inputSchema`**.
 
-There is no process spawn, no JSON-RPC handshake, and no tool enumeration from the remote server.
-The `mcp>=2.0.0` dependency in `pyproject.toml` is **never imported anywhere in `src/`**. So
-"external MCP server" today means: a placeholder the router may select, which returns a string
-saying it was dispatched. `bridges/mcp_evaluator_server.py` is a real MCP server implementation,
-but it is the thing being served *to* other clients, not something this runtime connects to.
+The protocol is implemented directly (newline-delimited JSON-RPC 2.0) rather than through the
+`mcp` SDK. The reason is specific: the installed `mcp` is 2.2.0, where `FastMCP` was renamed
+`MCPServer` and client signatures changed; the wire specification is the stable part, so an SDK
+upgrade cannot silently break tool calls.
+
+Formally:
+
+| Behaviour | Before | Now |
+|---|---|---|
+| Process spawn | none | real subprocess, lazily on first use |
+| Handshake / discovery | none | `initialize` + `tools/list` |
+| Tool registration | one schema-less `mcp_<name>_dispatch` per server | one tool per discovered tool, with its real schema |
+| Tool call | returned an f-string | forwarded over JSON-RPC; returns the server's actual result |
+| Failed server | reported **success** | `Error:`-prefixed message naming the server and reason |
+| Arg validation | none | reuses `validate_tool_args` from `dispatcher.py` |
+| Lifecycle | none | `connect()` / `shutdown()` / `close(name)` / `atexit`, plus `health()` |
+
+`mcp_<name>_dispatch` is retained only as a working forwarder taking `tool`/`arguments`.
+Discovered tools are `requires_approval=True` and never overwrite a built-in — a server that
+tries to redefine `run_shell_command` is renamed rather than allowed to shadow it.
+
+`HAS_MCP` gates **HTTP transport only**; stdio needs no SDK, so stdio is not gated by it. An HTTP
+server without the `mcp` package reports that dependency by name.
+
+`bridges/mcp_evaluator_server.py` remains a real MCP server implementation — the thing being
+served *to* other clients, not something this runtime connects to.
+
+**Verified:** `tests/test_mcp_manager.py` drives a real stdio server
+(`tests/fixtures/echo_mcp_server.py`) that computes its own results; a failed server produces a
+named error, and the old success-looking placeholder string is asserted unreachable.
 
 ---
 
@@ -422,11 +447,21 @@ enabled jobs and calls `_is_due`. `_is_due` is a **hand-rolled, minute-resolutio
 - Guards against double-fire with a 55-second window since `last_run_at`.
 
 `_run_job` builds a fresh dispatcher from `dispatcher_factory()` (or skips if none is configured),
-runs the goal, and updates `last_run_at` / `run_count` in a `finally`.
+runs the goal, and updates `last_run_at` / `run_count` / `last_status` in a `finally`. A raise from
+one job is contained per job inside `_tick`, so a broken entry cannot starve the rest of the pass.
 
-**The scheduler only runs inside a long-lived process.** `GatewayRunner.run` starts
-`asyncio.create_task(self.scheduler.run_forever())` alongside polling. `dual-agent --ui` constructs
-a `CronScheduler` for the `/api/schedules` endpoint but never ticks it.
+**The scheduler runs inside every long-lived process, and nowhere else.** `GatewayRunner.run` starts
+`asyncio.create_task(self.scheduler.run_forever())` (60s) alongside polling. `dual-agent --ui` starts
+its own tick loop in the FastAPI lifespan (20s, in `web/server.py`), executed via
+`run_in_executor` so the blocking SQLite/agent work cannot stall HTTP or WebSocket traffic, and
+cancelled on shutdown. `/api/schedules` reports `scheduler_running` from that live loop rather than
+asserting `true`, alongside `tick_seconds` and `last_tick_error`.
+
+**Delivery is stdout only.** `_run_job` prints results to the host process's console; there is no
+chat transport in the scheduler, so a job result is never pushed to a chat. `/api/schedules` returns
+`delivery: "stdout"` and says so in its `note`. Additionally, the dashboard has no terminal attached,
+so an interactive tool that requests approval fails with `EOF when reading a line` — unattended runs
+need `DUAL_AGENT_AUTO_ALLOW_PERMISSIONS=true` under `dual-agent --gateway`.
 
 ---
 
@@ -511,7 +546,7 @@ REST endpoints:
 | GET | `/api/skills` | Parsed `.SKILL.md` list |
 | GET | `/api/memory` | `get_aggregate_stats()` + top-10 learned skills |
 | GET | `/api/tools` | Tool name, description, `requires_approval`, `risk_level` |
-| GET | `/api/schedules` | All cron jobs |
+| GET | `/api/schedules` | `{jobs, scheduler_running, tick_seconds, last_tick_error, delivery, note}` |
 | POST | `/api/schedule` | `{description, goal}` → `{ok, job_id}` or `{ok: false, error}` |
 | GET | `/api/profile` | USER.md content |
 | WS | `/ws` | Below |
@@ -653,8 +688,18 @@ Plain statements of what does not work or is weak today, read off the code.
 
 - `_is_due` supports wildcards, steps (`*/N`), exact values, comma-separated lists, ranges, range steps,
   month names (`jan`-`dec`), and weekday names (`mon`-`sun`).
-- `dual-agent ui` runs a background tick loop every 20s. Scheduled jobs execute in the background;
-  results are logged to console and stored in memory.
+- `dual-agent ui` runs a background tick loop every 20s, in the lifespan, via `run_in_executor`.
+  Scheduled jobs execute in that process; results are printed to its console and the run outcome is
+  stored in `scheduled_jobs.last_status`. Nothing is delivered to a chat.
+
+**Sessions**
+
+- `SessionRouter` keeps at most `max_sessions` resident chats (default `DEFAULT_MAX_SESSIONS = 256`,
+  override with `DUAL_AGENT_MAX_SESSIONS`), evicting least-recently-used first. `get_or_create` on an
+  existing chat refreshes its recency, so a busy chat is not evicted for being oldest.
+- Eviction drops only the in-memory dispatcher. The chat's on-disk session directory is left intact,
+  so a returning chat reopens its own history. Isolation is preserved: each chat keeps its own
+  dispatcher and its own `memory.db`.
 
 **Gateway and dashboard**
 

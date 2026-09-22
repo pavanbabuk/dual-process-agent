@@ -38,6 +38,12 @@ class SystemTwoResponse(BaseModel):
     is_mock: bool = False
     # Why a real model was not used (unset while a real model answered).
     degraded_reason: Optional[str] = None
+    # Capability-specific measured facts for this call — for vision runs, the
+    # exact dimensions and byte size of every image that went on the wire, so a
+    # cost claim can be checked against what was actually sent rather than
+    # recomputed from a constant someone chose. Empty for text-only providers,
+    # which keeps this field additive and every existing call site unchanged.
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _mock_fallback(prompt: str, reason: str) -> "SystemTwoResponse":
@@ -53,7 +59,20 @@ def _mock_fallback(prompt: str, reason: str) -> "SystemTwoResponse":
 
 
 class SystemTwoProvider(ABC):
-    """Abstract interface for System 2 fallback reasoners."""
+    """Abstract interface for System 2 fallback reasoners.
+
+    `images` is OPTIONAL and defaults to None. It was added without a required
+    parameter and without a new overload so that:
+      - every provider written before it existed still satisfies the interface,
+        and any subclass that declares only `generate_step(self, prompt)` keeps
+        working when the dispatcher calls it with `images=`;
+      - every existing call site (`generate_step(prompt)`) is byte-for-byte
+        unchanged in behaviour.
+
+    Subclasses that cannot see should reject `images` with a named reason rather
+    than ignore the argument — see VisionSystemTwoProvider and the text-only
+    providers' multimodal rejection in this module.
+    """
 
     @abstractmethod
     def generate_step(
@@ -257,22 +276,39 @@ class DeepSeekProvider(SystemTwoProvider):
             logger.warning(f"{reason} — falling back to mock.")
             return _mock_fallback(prompt, reason)
 
-        # DeepSeek V3 and R1 are text-only; they do not process multimodal image payloads.
+        # The previous revision hard-rejected every image here on the claim that
+        # DeepSeek is text-only. Measured on this machine (2026-09-22), the
+        # configured model is NOT text-only: api.deepseek.com returned HTTP 200
+        # for image_url payloads on 12/12 attempts, and the model named a solid
+        # red frame "Red" and a solid green frame "Green". A hard-coded refusal
+        # therefore discarded images the endpoint would have accepted, and
+        # silently substituted canned text — the exact failure this repo has
+        # shipped before. The image is now sent, and whatever the endpoint
+        # answers (including a 400 that rejects multimodal input) is reported.
+        # Note the model is also unreliable: it answered "White" for a pure
+        # black frame, so a reading is evidence, not ground truth.
         if images:
-            reason = (
-                f"Configured provider 'deepseek' ({self.model}) is text-only and does not "
-                "support visual image inputs. A vision-capable model (e.g. gpt-4o, grok-2-vision, "
-                "or local VLM) must be configured for screen control tasks."
+            logger.info(
+                f"[DeepSeekProvider] Sending {len(images)} image(s) to {self.model}. "
+                "If this endpoint cannot see, it will reject the request and the "
+                "rejection is reported in degraded_reason rather than assumed."
             )
-            logger.warning(reason)
-            res = _mock_fallback(prompt, reason)
-            res.degraded_reason = reason
-            return res
 
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
+
+        user_content: Any = prompt
+        if images:
+            content_parts: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+            for img_path in images:
+                if os.path.isfile(img_path):
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": _encode_image_to_data_url(img_path)},
+                    })
+            user_content = content_parts
 
         payload = {
             "model": self.model,
@@ -281,7 +317,7 @@ class DeepSeekProvider(SystemTwoProvider):
                     "role": "system",
                     "content": 'You are a deliberate System 2 agent. Output valid JSON: {"thought": "...", "action": "...", "args": {...}}'
                 },
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": user_content},
             ],
             "max_tokens": int(os.getenv("SYSTEM_TWO_MAX_TOKENS", "4000")),
         }
@@ -340,16 +376,41 @@ class DeepSeekProvider(SystemTwoProvider):
                     tokens_used=tokens,
                 )
         except httpx.HTTPStatusError as e:
+            # Include the endpoint's own message. A bare "status 400" hides the
+            # one fact that matters for a vision request — whether the model
+            # refused because it cannot see, or something else was malformed.
+            detail = self._response_detail(e)
             if e.response.status_code == 429:
                 reason = f"DeepSeek API ({self.model}) returned 429 Too Many Requests (rate-limited)."
             else:
-                reason = f"DeepSeek API call ({self.model}) failed with status {e.response.status_code}: {e}"
+                reason = (
+                    f"DeepSeek API call ({self.model}) failed with status "
+                    f"{e.response.status_code}: {detail}"
+                )
             logger.warning(f"{reason} — falling back to mock.")
             return _mock_fallback(prompt, reason)
         except Exception as e:
             reason = f"DeepSeek API call ({self.model}) failed: {type(e).__name__}: {e}"
             logger.warning(f"{reason} — falling back to mock.")
             return _mock_fallback(prompt, reason)
+
+    @staticmethod
+    def _response_detail(e: httpx.HTTPStatusError) -> str:
+        """Best-effort extraction of an API error message from a failed response."""
+        try:
+            body = e.response.json()
+            if isinstance(body, dict):
+                err = body.get("error")
+                if isinstance(err, dict) and err.get("message"):
+                    return str(err["message"])
+                if isinstance(err, str):
+                    return err
+                if body.get("message"):
+                    return str(body["message"])
+        except Exception:
+            pass
+        text = (e.response.text or "").strip()
+        return text[:200] if text else str(e)
 
 
 class OpenAICompatibleProvider(SystemTwoProvider):
@@ -485,47 +546,90 @@ def get_system_two_provider(
 def get_vision_provider(
     config: Optional[Any] = None,
 ) -> SystemTwoProvider:
-    """Resolve vision-capable System 2 provider following configuration precedence.
+    """Resolve a vision-capable System 2 provider for screen control.
 
-    Honest resolution: if no real vision provider or keys are present, returns
-    MockSystemTwoProvider with degraded_reason clearly stated.
+    Resolution order is the same one used everywhere else in this module: an
+    explicitly-configured provider beats a credential that happens to be present,
+    which beats having nothing at all.
+
+    A miss does NOT return a bare MockSystemTwoProvider. The previous revision
+    did, and that is the failure mode this function exists to avoid: a screen
+    loop handed a mock gets canned text back, `degraded_reason` said only "mock
+    provider", and a run with no eyes in it looked like a run that had seen the
+    screen. Every miss now returns `BlockedVisionProvider` carrying the specific
+    precondition that was not met, and callers surface it.
     """
     from dual_agent.config import load_config
+    from dual_agent.vision import VisionSystemTwoProvider, BlockedVisionProvider
+
     cfg = config or load_config()
 
     v_provider = (cfg.vision_provider or os.getenv("VISION_PROVIDER") or "").lower()
+    vision_model = cfg.vision_model or os.getenv("VISION_MODEL")
+    vision_key = cfg.vision_api_key or os.getenv("VISION_API_KEY")
+    vision_url = cfg.vision_base_url or os.getenv("VISION_BASE_URL")
+
+    def _unavailable(reason: str) -> SystemTwoProvider:
+        return BlockedVisionProvider(reason)
 
     if v_provider in ("openai", "gpt"):
-        key = cfg.vision_api_key or cfg.openai_api_key or os.getenv("VISION_API_KEY") or os.getenv("OPENAI_API_KEY")
-        return OpenAICompatibleProvider(
+        key = vision_key or cfg.openai_api_key or os.getenv("OPENAI_API_KEY")
+        if not key:
+            return _unavailable(
+                "vision_provider='openai' is configured but no OpenAI key was found "
+                "(VISION_API_KEY / OPENAI_API_KEY / vision_api_key). A screen agent "
+                "cannot see without a vision credential."
+            )
+        return VisionSystemTwoProvider(
             api_key=key,
-            base_url=cfg.vision_base_url or os.getenv("VISION_BASE_URL", "https://api.openai.com/v1"),
-            model=cfg.vision_model or os.getenv("VISION_MODEL", "gpt-4o"),
+            base_url=vision_url or "https://api.openai.com/v1",
+            model=vision_model or "gpt-4o",
         )
-    elif v_provider in ("grok", "xai"):
-        key = cfg.vision_api_key or cfg.grok_api_key or os.getenv("VISION_API_KEY") or os.getenv("GROK_API_KEY")
-        return OpenAICompatibleProvider(
+    if v_provider in ("grok", "xai"):
+        key = vision_key or cfg.grok_api_key or os.getenv("GROK_API_KEY")
+        if not key:
+            return _unavailable(
+                "vision_provider='grok' is configured but no xAI key was found "
+                "(VISION_API_KEY / GROK_API_KEY). A screen agent cannot see without "
+                "a vision credential."
+            )
+        return VisionSystemTwoProvider(
             api_key=key,
-            base_url=cfg.vision_base_url or os.getenv("VISION_BASE_URL", "https://api.x.ai/v1"),
-            model=cfg.vision_model or os.getenv("VISION_MODEL", "grok-2-vision-1212"),
+            base_url=vision_url or "https://api.x.ai/v1",
+            model=vision_model or "grok-2-vision-1212",
         )
-    elif v_provider in ("custom", "local", "ollama", "omniroute", "vllm"):
-        return CustomLLMProvider(
-            base_url=cfg.vision_base_url or cfg.custom_llm_base_url,
-            model=cfg.vision_model or "llava",
-            api_key=cfg.vision_api_key or cfg.custom_llm_api_key,
+    if v_provider in ("custom", "local", "ollama", "omniroute", "vllm"):
+        # A local OpenAI-compatible server. The key is optional by design here —
+        # Ollama and friends take no credential — so the precondition being
+        # checked is a reachable model name, not a secret.
+        if not (vision_model or cfg.custom_llm_model):
+            return _unavailable(
+                "vision_provider='custom' is configured but no VLM model name was "
+                "given (VISION_MODEL / custom_llm_model)."
+            )
+        return VisionSystemTwoProvider(
+            base_url=vision_url or cfg.custom_llm_base_url,
+            model=vision_model or cfg.custom_llm_model,
+            api_key=vision_key or cfg.custom_llm_api_key or "",
         )
-    elif cfg.openai_api_key or os.getenv("OPENAI_API_KEY"):
-        return OpenAICompatibleProvider(
+    # Bare credentials still count as a deliberate configuration: someone set a
+    # key for a vision-capable provider and expects it to be used.
+    if cfg.openai_api_key or os.getenv("OPENAI_API_KEY"):
+        return VisionSystemTwoProvider(
             api_key=cfg.openai_api_key or os.getenv("OPENAI_API_KEY"),
-            model=cfg.vision_model or "gpt-4o",
+            base_url=vision_url or "https://api.openai.com/v1",
+            model=vision_model or "gpt-4o",
         )
-    elif cfg.grok_api_key or os.getenv("GROK_API_KEY"):
-        return OpenAICompatibleProvider(
+    if cfg.grok_api_key or os.getenv("GROK_API_KEY"):
+        return VisionSystemTwoProvider(
             api_key=cfg.grok_api_key or os.getenv("GROK_API_KEY"),
-            base_url="https://api.x.ai/v1",
-            model=cfg.vision_model or "grok-2-vision-1212",
+            base_url=vision_url or "https://api.x.ai/v1",
+            model=vision_model or "grok-2-vision-1212",
         )
-    else:
-        mock = MockSystemTwoProvider()
-        return mock
+
+    return _unavailable(
+        "no vision model configured. Set vision_provider plus VISION_MODEL and "
+        "VISION_API_KEY (or vision_model / vision_api_key in "
+        "~/.dual_agent/config.json). Screen control without a multimodal model has "
+        "no way to look at the screen."
+    )

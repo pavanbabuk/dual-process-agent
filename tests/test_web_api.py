@@ -78,6 +78,28 @@ def test_api_schedules_empty(client):
     assert "jobs" in r.json()
 
 
+def test_api_schedules_reports_live_scheduler_state(client):
+    """The contract must expose live scheduler state, not a hardcoded running=True.
+
+    Previously /api/schedules returned `running: True` unconditionally while the
+    dashboard's tick loop never dispatched, so the UI advertised jobs that could
+    not run.
+    """
+    r = client.get("/api/schedules")
+    assert r.status_code == 200
+    body = r.json()
+
+    assert body["scheduler_running"] is True  # this client runs the lifespan
+    assert isinstance(body["tick_seconds"], int) and body["tick_seconds"] > 0
+    assert "last_tick_error" in body
+
+    # Delivery is stdout, and the note must say chat delivery does not happen.
+    assert body["delivery"] == "stdout"
+    note = body["note"]
+    assert "NOT sent" in note and "chat" in note.lower()
+    assert "gateway" in note.lower()
+
+
 def test_api_add_schedule_valid(client):
     r = client.post("/api/schedule", json={
         "description": "every day at 9am",

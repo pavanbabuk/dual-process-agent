@@ -10,6 +10,28 @@ from dual_agent.memory import get_default_data_dir
 
 logger = logging.getLogger(__name__)
 
+# Long-edge bound for screenshots sent to a vision model. Defined here (not in
+# vision.py) because config.py is imported by everything and must not import the
+# optional Pillow/httpx stack to know its own default.
+DEFAULT_VISION_MAX_DIMENSION = 1400
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    """Parse a boolean from a config.json value or an environment string.
+
+    Needed because `_resolve` hands back raw strings for environment variables:
+    `bool(os.environ["DUAL_AGENT_VISION_ENABLED"])` is True for "0" and "false",
+    so routing an enable flag through the generic resolver would turn an
+    explicit disable into an enable.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
 
 class AgentConfig(BaseModel):
     """Configuration settings for Dual-Process Agent."""
@@ -42,11 +64,18 @@ class AgentConfig(BaseModel):
     auto_learn_skills: bool = True
     auto_scan_workspace: bool = True
 
-    # Vision Provider (paid/local VLM for screen control)
+    # Vision Provider (paid/local VLM for screen control). A screen-control run
+    # cannot see without one; `vision_enabled=False` makes a screen run fail with
+    # a named precondition instead of falling back to the mock, which would look
+    # like a screen reading.
     vision_provider: Optional[str] = None
     vision_model: Optional[str] = None
     vision_base_url: Optional[str] = None
     vision_api_key: Optional[str] = None
+    vision_enabled: bool = False
+    # Long-edge bound applied before any screenshot is transmitted. Measured in
+    # pixels, not estimated from a constant.
+    vision_max_dimension: int = 1400
 
     def model_post_init(self, __context: Any) -> None:
         """Sync backward-compatible hermes_* fields with custom_llm_* fields."""
@@ -146,6 +175,14 @@ def load_config() -> AgentConfig:
         # 4. Code default
         return data.get(key, default)
 
+    def _resolve_bool(key: str, env_var: str, default: bool = False) -> bool:
+        """Same precedence as _resolve, with the value parsed as a boolean.
+
+        config.json stays the source of truth for a deliberate value; a shell
+        environment variable overrides it only when actually exported.
+        """
+        return _coerce_bool(_resolve(key, env_var, default), default)
+
     resolved: Dict[str, Any] = {
         "typesafe_api_key": _resolve("typesafe_api_key", "TYPESAFE_API_KEY", None),
         "typesafe_base_url": _resolve("typesafe_base_url", "TYPESAFE_BASE_URL", "https://api.typesafe.ai"),
@@ -173,6 +210,13 @@ def load_config() -> AgentConfig:
         "vision_model": _resolve("vision_model", "VISION_MODEL", None),
         "vision_base_url": _resolve("vision_base_url", "VISION_BASE_URL", None),
         "vision_api_key": _resolve("vision_api_key", "VISION_API_KEY", None),
+        # Boolean settings need an explicit parser: _resolve returns raw strings
+        # for env vars, and bool("false") is True — so honouring VISION_ENABLED=0
+        # through the generic path would silently enable vision.
+        "vision_enabled": _resolve_bool("vision_enabled", "DUAL_AGENT_VISION_ENABLED", False),
+        "vision_max_dimension": int(
+            _resolve("vision_max_dimension", "VISION_MAX_DIMENSION", DEFAULT_VISION_MAX_DIMENSION)
+        ),
         "auto_learn_skills": bool(data.get("auto_learn_skills", True)),
         "auto_scan_workspace": bool(data.get("auto_scan_workspace", True)),
     }

@@ -92,7 +92,32 @@ def create_app(
 
     # ── FastAPI app ─────────────────────────────────────────────────────────
 
-    # Use lifespan instead of deprecated on_event
+    # Tick the scheduler in this process for the dashboard's lifetime.
+    #
+    # The loop previously called scheduler._tick() on a fixed 20s wait loop.
+    # That did dispatch, but it meant /api/schedules advertised jobs while the
+    # dashboard was the only process running them — and a scheduled job that
+    # needs approval blocked on stdin ("EOF when reading a line") because there
+    # is no terminal here. So the dashboard now runs ticks (a job created in the
+    # UI fires without a separate daemon) and names its own limitations in the
+    # API, rather than listing jobs that look scheduled but cannot complete.
+    SCHED_TICK_SECONDS = 20
+    scheduler_state = {"task": None, "running": False, "last_error": None}
+
+    async def _scheduler_loop() -> None:
+        while True:
+            try:
+                # _tick() is blocking (SQLite + agent subprocesses); run it off
+                # the event loop or every HTTP/WebSocket request stalls behind it.
+                await asyncio.get_running_loop().run_in_executor(None, scheduler._tick)
+                scheduler_state["last_error"] = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                scheduler_state["last_error"] = str(e)
+                logger.warning(f"[Scheduler] Tick failed: {e}")
+            await asyncio.sleep(SCHED_TICK_SECONDS)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Startup
@@ -103,28 +128,25 @@ def create_app(
                 webbrowser.open(f"http://{host}:{port}")
             asyncio.create_task(_open())
 
-        # Tick scheduler periodically in background while dashboard is running
-        stop_scheduler = asyncio.Event()
-
-        async def _scheduler_tick_loop():
-            while not stop_scheduler.is_set():
-                try:
-                    scheduler._tick()
-                except Exception as e:
-                    logger.warning(f"[Scheduler] Tick failed: {e}")
-                try:
-                    await asyncio.wait_for(stop_scheduler.wait(), timeout=20.0)
-                except asyncio.TimeoutError:
-                    pass
-
-        scheduler_task = asyncio.create_task(_scheduler_tick_loop())
-
-        logger.info(f"[Dashboard] Running at http://{host}:{port}")
+        scheduler_state["task"] = asyncio.create_task(_scheduler_loop())
+        scheduler_state["running"] = True
+        job_count = len(scheduler.list_jobs())
+        logger.info(
+            f"[Dashboard] Running at http://{host}:{port} "
+            f"(scheduler ticking every {SCHED_TICK_SECONDS}s, {job_count} job(s))"
+        )
         yield
 
-        # Shutdown
-        stop_scheduler.set()
-        scheduler_task.cancel()
+        # Shutdown: stop the loop and let it unwind before the DB closes.
+        scheduler_state["running"] = False
+        task = scheduler_state["task"]
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            scheduler_state["task"] = None
 
     app = FastAPI(title="Dual-Process Agent", version="2.0.0", lifespan=lifespan)
 
@@ -205,10 +227,28 @@ def create_app(
 
     @app.get("/api/schedules")
     async def api_schedules():
+        """List cron jobs plus the honest execution/delivery contract.
+
+        `scheduler_running` is read from the live loop, not hardcoded: a previous
+        version always returned running=True. `delivery` exists because job
+        output goes to this process's stdout and is never pushed to a chat —
+        the UI must not imply a notification that never arrives.
+        """
         return {
             "jobs": scheduler.list_jobs(),
-            "running": True,
-            "note": "Scheduled jobs execute in the background. Output is saved to execution memory and logged to console; chat delivery requires the Telegram gateway.",
+            "scheduler_running": bool(scheduler_state["running"]),
+            "tick_seconds": SCHED_TICK_SECONDS,
+            "last_tick_error": scheduler_state["last_error"],
+            "delivery": "stdout",
+            "note": (
+                "Jobs run in whichever long-lived process is ticking the "
+                "scheduler (this dashboard or `dual-agent gateway`). Output goes "
+                "to that process's console and execution memory — it is NOT sent "
+                "to any chat. Interactive tools that need approval are denied "
+                "here because there is no terminal to answer the prompt; run "
+                "`dual-agent gateway` with DUAL_AGENT_AUTO_ALLOW_PERMISSIONS=true "
+                "for unattended runs."
+            ),
         }
 
     @app.post("/api/schedule")

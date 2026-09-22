@@ -37,7 +37,7 @@ from dual_agent.system_two import get_system_two_provider
 from dual_agent.typesafe_client import JevSystemOneClient
 
 from dual_agent.gateway.base import IncomingMessage
-from dual_agent.gateway.session_router import SessionRouter
+from dual_agent.gateway.session_router import DEFAULT_MAX_SESSIONS, SessionRouter
 from dual_agent.gateway.telegram_adapter import TelegramAdapter
 
 logger = logging.getLogger(__name__)
@@ -81,6 +81,9 @@ class GatewayRunner:
         self.router = SessionRouter(
             dispatcher_factory=self.build_dispatcher,
             base_data_dir=self.session_root,
+            max_sessions=int(
+                os.getenv("DUAL_AGENT_MAX_SESSIONS", str(DEFAULT_MAX_SESSIONS))
+            ),
         )
         self.adapter: Optional[TelegramAdapter] = None
 
@@ -221,6 +224,10 @@ class GatewayRunner:
             f"{sorted(self.adapter.allowed_user_ids) or 'NONE (all messages rejected)'}"
         )
         logger.info(f"[Gateway] Sessions dir: {self.session_root}")
+        logger.info(
+            f"[Gateway] Session cap: {self.router.max_sessions} resident "
+            f"(LRU eviction; set DUAL_AGENT_MAX_SESSIONS to change)"
+        )
         logger.info(
             f"[Gateway] Scheduler jobs: {len(self.scheduler.list_jobs())} "
             "(dispatched every 60s while this process runs)"

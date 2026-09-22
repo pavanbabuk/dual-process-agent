@@ -307,6 +307,49 @@ class DualProcessDispatcher:
                 kw in goal.lower()
                 for kw in ("screen", "desktop", "click", "mouse", "window", "display", "gui", "screenshot", "type into")
             ) or (os.environ.get("DUAL_AGENT_SCREEN_LOOP", "0").lower() in ("1", "true"))
+
+        # --- VISION PRECONDITION ---
+        # A screen loop needs eyes, and sight is the part that is not free. If
+        # the provider cannot see, say so now and refuse the run: capturing
+        # screenshots for an agent that will never look at them burns steps, and
+        # the failure would otherwise surface late as a generic System 2 abort.
+        #
+        # Only a real implementation counts. `getattr` on a MagicMock returns a
+        # truthy mock for *any* attribute, so a bare getattr would make every
+        # mocked test provider look blind and short-circuit its run — the check
+        # must be for a concrete method on the class, not for attribute presence.
+        screen_preflight = None
+        s2_has_preflight = getattr(type(self.s2), "preflight", None)
+        if callable(s2_has_preflight):
+            screen_preflight = getattr(self.s2, "preflight")
+        if enable_screen_loop and callable(screen_preflight):
+            blocking = screen_preflight()
+            if blocking:
+                message = (
+                    f"Screen control was requested but the System 2 provider cannot see: "
+                    f"{blocking}"
+                )
+                logger.warning(f"[Dispatcher] {message}")
+                return DispatchResult(
+                    goal=goal,
+                    is_completed=False,
+                    final_output=f"System 2 failure: {message}",
+                    total_steps=0,
+                    system_one_steps=0,
+                    system_two_steps=0,
+                    total_latency_ms=(time.perf_counter() - run_started_at) * 1000,
+                    system_one_latency_ms=0.0,
+                    system_two_latency_ms=0.0,
+                    tokens_used=0,
+                    used_simulated_system_one=bool(getattr(self.s1, "force_simulation", False)),
+                    system_one_fallback_reason=getattr(self.s1, "simulation_reason", None) or None,
+                    simulated_latency_ms=0.0,
+                    # Reported as a degraded System 2 so no caller reads a
+                    # zero-step run as a completed goal.
+                    system_two_is_mock=True,
+                    system_two_degraded_reason=message,
+                    plan=[],
+                )
         # Verification router calls are billed here as they happen; anything the
         # per-step records miss is reconciled against the wall clock at the end.
         self._verification_clock_ms = 0.0
