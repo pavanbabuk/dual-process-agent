@@ -88,6 +88,7 @@ def create_app(
         skills_manager=skills,
         confidence_threshold=cfg.system_one_confidence_threshold,
     )
+    scheduler = CronScheduler(memory_engine=memory, dispatcher_factory=lambda: dispatcher)
 
     # ── FastAPI app ─────────────────────────────────────────────────────────
 
@@ -101,9 +102,29 @@ def create_app(
                 import webbrowser
                 webbrowser.open(f"http://{host}:{port}")
             asyncio.create_task(_open())
+
+        # Tick scheduler periodically in background while dashboard is running
+        stop_scheduler = asyncio.Event()
+
+        async def _scheduler_tick_loop():
+            while not stop_scheduler.is_set():
+                try:
+                    scheduler._tick()
+                except Exception as e:
+                    logger.warning(f"[Scheduler] Tick failed: {e}")
+                try:
+                    await asyncio.wait_for(stop_scheduler.wait(), timeout=20.0)
+                except asyncio.TimeoutError:
+                    pass
+
+        scheduler_task = asyncio.create_task(_scheduler_tick_loop())
+
         logger.info(f"[Dashboard] Running at http://{host}:{port}")
         yield
-        # Shutdown (nothing to clean up)
+
+        # Shutdown
+        stop_scheduler.set()
+        scheduler_task.cancel()
 
     app = FastAPI(title="Dual-Process Agent", version="2.0.0", lifespan=lifespan)
 
@@ -184,7 +205,11 @@ def create_app(
 
     @app.get("/api/schedules")
     async def api_schedules():
-        return {"jobs": scheduler.list_jobs()}
+        return {
+            "jobs": scheduler.list_jobs(),
+            "running": True,
+            "note": "Scheduled jobs execute in the background. Output is saved to execution memory and logged to console; chat delivery requires the Telegram gateway.",
+        }
 
     @app.post("/api/schedule")
     async def api_add_schedule(body: dict):
@@ -199,6 +224,223 @@ def create_app(
     @app.get("/api/profile")
     async def api_profile():
         return {"profile": memory.get_user_profile()}
+
+    @app.get("/api/screen/preview")
+    async def api_screen_preview(grid: bool = False):
+        try:
+            from dual_agent.screen import capture_screenshot, render_grid_overlay
+            from dual_agent.system_two import _encode_image_to_data_url
+
+            meta = capture_screenshot()
+            img_path = meta["path"]
+            if grid:
+                img_path = render_grid_overlay(img_path)
+
+            data_url = _encode_image_to_data_url(img_path)
+            return {
+                "ok": True,
+                "data_url": data_url,
+                "logical_width": meta["logical_width"],
+                "logical_height": meta["logical_height"],
+                "pixel_width": meta["pixel_width"],
+                "pixel_height": meta["pixel_height"],
+                "scale_x": meta["scale_x"],
+                "scale_y": meta["scale_y"],
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/api/screen/click")
+    async def api_screen_click(body: dict):
+        try:
+            from dual_agent.screen import click_mouse
+            x = float(body.get("x", 0))
+            y = float(body.get("y", 0))
+            btn = str(body.get("button", "left"))
+            ctype = str(body.get("click_type", "single"))
+            res = click_mouse(x=x, y=y, button=btn, click_type=ctype)
+            return {"ok": True, "result": res}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/api/screen/type")
+    async def api_screen_type(body: dict):
+        try:
+            from dual_agent.screen import send_key_press
+            text = str(body.get("text", ""))
+            key = body.get("key")
+            modifiers = body.get("modifiers")
+            if key:
+                res = send_key_press(key=str(key), modifiers=modifiers)
+            elif text:
+                for char in text:
+                    send_key_press(key=char)
+                res = {"typed": text}
+            else:
+                return {"ok": False, "error": "No key or text provided"}
+            return {"ok": True, "result": res}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.get("/api/config")
+    async def api_get_config():
+        return {
+            "typesafe_api_key": cfg.typesafe_api_key or "",
+            "typesafe_base_url": cfg.typesafe_base_url,
+            "system_two_provider": cfg.system_two_provider,
+            "system_one_confidence_threshold": cfg.system_one_confidence_threshold,
+            "deepseek_api_key": cfg.deepseek_api_key or "",
+            "deepseek_model": cfg.deepseek_model or "deepseek-chat",
+            "grok_api_key": cfg.grok_api_key or "",
+            "grok_model": cfg.grok_model,
+            "openai_api_key": cfg.openai_api_key or "",
+            "anthropic_api_key": cfg.anthropic_api_key or "",
+            "custom_llm_base_url": cfg.custom_llm_base_url or cfg.hermes_base_url or "http://localhost:11434/v1",
+            "custom_llm_model": cfg.custom_llm_model or cfg.hermes_model or "llama3.1",
+            "custom_llm_api_key": cfg.custom_llm_api_key or cfg.hermes_api_key or "",
+            "vision_provider": cfg.vision_provider or "",
+            "vision_model": cfg.vision_model or "",
+            "vision_base_url": cfg.vision_base_url or "",
+            "vision_api_key": cfg.vision_api_key or "",
+            "screen_control_enabled": os.getenv("DUAL_AGENT_SCREEN_CONTROL", "1") != "0",
+            "is_simulation": (
+                os.getenv("DUAL_AGENT_UI_FORCE_SIMULATION", "false").lower() == "true"
+                or not cfg.typesafe_api_key
+            ),
+        }
+
+    @app.post("/api/config")
+    async def api_post_config(body: dict):
+        from dual_agent.config import save_config
+
+        # Update config fields if provided
+        if "typesafe_api_key" in body:
+            cfg.typesafe_api_key = body["typesafe_api_key"].strip() or None
+            if cfg.typesafe_api_key:
+                os.environ["TYPESAFE_API_KEY"] = cfg.typesafe_api_key
+            elif "TYPESAFE_API_KEY" in os.environ:
+                del os.environ["TYPESAFE_API_KEY"]
+
+        if "typesafe_base_url" in body and body["typesafe_base_url"].strip():
+            cfg.typesafe_base_url = body["typesafe_base_url"].strip()
+
+        if "system_two_provider" in body and body["system_two_provider"].strip():
+            cfg.system_two_provider = body["system_two_provider"].strip()
+            os.environ["SYSTEM_TWO_PROVIDER"] = cfg.system_two_provider
+
+        if "system_one_confidence_threshold" in body:
+            try:
+                cfg.system_one_confidence_threshold = float(body["system_one_confidence_threshold"])
+            except (ValueError, TypeError):
+                pass
+
+        if "deepseek_api_key" in body:
+            cfg.deepseek_api_key = body["deepseek_api_key"].strip() or None
+            if cfg.deepseek_api_key:
+                os.environ["DEEPSEEK_API_KEY"] = cfg.deepseek_api_key
+            elif "DEEPSEEK_API_KEY" in os.environ:
+                del os.environ["DEEPSEEK_API_KEY"]
+
+        if "deepseek_model" in body and body["deepseek_model"].strip():
+            cfg.deepseek_model = body["deepseek_model"].strip()
+            os.environ["DEEPSEEK_MODEL"] = cfg.deepseek_model
+
+        if "grok_api_key" in body:
+            cfg.grok_api_key = body["grok_api_key"].strip() or None
+            if cfg.grok_api_key:
+                os.environ["GROK_API_KEY"] = cfg.grok_api_key
+            elif "GROK_API_KEY" in os.environ:
+                del os.environ["GROK_API_KEY"]
+
+        if "grok_model" in body and body["grok_model"].strip():
+            cfg.grok_model = body["grok_model"].strip()
+
+        if "openai_api_key" in body:
+            cfg.openai_api_key = body["openai_api_key"].strip() or None
+            if cfg.openai_api_key:
+                os.environ["OPENAI_API_KEY"] = cfg.openai_api_key
+            elif "OPENAI_API_KEY" in os.environ:
+                del os.environ["OPENAI_API_KEY"]
+
+        if "anthropic_api_key" in body:
+            cfg.anthropic_api_key = body["anthropic_api_key"].strip() or None
+            if cfg.anthropic_api_key:
+                os.environ["ANTHROPIC_API_KEY"] = cfg.anthropic_api_key
+            elif "ANTHROPIC_API_KEY" in os.environ:
+                del os.environ["ANTHROPIC_API_KEY"]
+
+        custom_url = body.get("custom_llm_base_url") or body.get("hermes_base_url")
+        if custom_url and custom_url.strip():
+            cfg.custom_llm_base_url = custom_url.strip()
+            os.environ["CUSTOM_LLM_BASE_URL"] = cfg.custom_llm_base_url
+
+        custom_model = body.get("custom_llm_model") or body.get("hermes_model")
+        if custom_model and custom_model.strip():
+            cfg.custom_llm_model = custom_model.strip()
+            os.environ["CUSTOM_LLM_MODEL"] = cfg.custom_llm_model
+
+        custom_key = body.get("custom_llm_api_key") or body.get("hermes_api_key")
+        if custom_key is not None:
+            cfg.custom_llm_api_key = custom_key.strip() or None
+            if cfg.custom_llm_api_key:
+                os.environ["CUSTOM_LLM_API_KEY"] = cfg.custom_llm_api_key
+            elif "CUSTOM_LLM_API_KEY" in os.environ:
+                del os.environ["CUSTOM_LLM_API_KEY"]
+
+        if "vision_provider" in body:
+            cfg.vision_provider = body["vision_provider"].strip() or None
+            if cfg.vision_provider:
+                os.environ["VISION_PROVIDER"] = cfg.vision_provider
+            elif "VISION_PROVIDER" in os.environ:
+                del os.environ["VISION_PROVIDER"]
+
+        if "vision_model" in body:
+            cfg.vision_model = body["vision_model"].strip() or None
+            if cfg.vision_model:
+                os.environ["VISION_MODEL"] = cfg.vision_model
+            elif "VISION_MODEL" in os.environ:
+                del os.environ["VISION_MODEL"]
+
+        if "vision_base_url" in body:
+            cfg.vision_base_url = body["vision_base_url"].strip() or None
+            if cfg.vision_base_url:
+                os.environ["VISION_BASE_URL"] = cfg.vision_base_url
+            elif "VISION_BASE_URL" in os.environ:
+                del os.environ["VISION_BASE_URL"]
+
+        if "vision_api_key" in body:
+            cfg.vision_api_key = body["vision_api_key"].strip() or None
+            if cfg.vision_api_key:
+                os.environ["VISION_API_KEY"] = cfg.vision_api_key
+            elif "VISION_API_KEY" in os.environ:
+                del os.environ["VISION_API_KEY"]
+
+        # Persist updated configuration
+        save_config(cfg)
+
+        # Hot-reload live System 1 and System 2 services
+        new_s1 = JevSystemOneClient(
+            api_key=cfg.typesafe_api_key,
+            base_url=cfg.typesafe_base_url,
+            force_simulation=(
+                os.getenv("DUAL_AGENT_UI_FORCE_SIMULATION", "false").lower() == "true"
+                or not cfg.typesafe_api_key
+            ),
+        )
+        new_s2 = get_system_two_provider(cfg.system_two_provider)
+
+        dispatcher.s1 = new_s1
+        dispatcher.s2 = new_s2
+        dispatcher.confidence_threshold = cfg.system_one_confidence_threshold
+
+        logger.info(f"[Config] Updated config: S1 (key_set={bool(cfg.typesafe_api_key)}), S2 ({cfg.system_two_provider})")
+
+        return {
+            "ok": True,
+            "provider": cfg.system_two_provider.upper(),
+            "confidence_threshold": cfg.system_one_confidence_threshold,
+            "is_simulation": not bool(cfg.typesafe_api_key),
+        }
 
     # ── WebSocket ────────────────────────────────────────────────────────────
 

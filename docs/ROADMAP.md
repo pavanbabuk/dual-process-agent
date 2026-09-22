@@ -20,33 +20,33 @@ Nine capabilities. Each is defined by something you can point at, not by an adje
 
 | # | Capability | Definition (checkable) | Status today |
 |---|---|---|---|
-| 1 | **Persistent skills** | Procedures are written to disk, survive process restart, are parsed back, and measurably affect what the agent does next. | **Partial.** Files are written and re-parsed (`skills_manager.py` → `synthesize_skill`, `load_all_skills`) and injected into the System 2 prompt (`build_skill_context`). But the SQLite `find_matching_skill` replay path is logged only and never changes routing, so a skill file's presence does not yet change behaviour. |
-| 2 | **Cross-session memory and recall** | Past runs are persisted, searchable by natural language, and injected into a later prompt. | **Exists.** `memory.py` — SQLite `sessions` + FTS5 `sessions_fts` with an AFTER INSERT trigger, `full_text_search` (with `LIKE` fallback), and `build_recall_context` prepended to the System 2 prompt. Surface: `/recall`, `GET /api/memory`. |
-| 3 | **Scheduled / cron jobs** | A job can be registered in natural language, persists across restarts, and fires on schedule without a human present. | **Partial.** `parse_nl_to_cron` + `CronScheduler` (SQLite CRUD, 60s asyncio tick, 55s double-fire guard) work, but only inside `dual-agent --gateway`. `--ui` never ticks. Results are printed to a daemon's stdout, not delivered. |
+| 1 | **Persistent skills** | Procedures are written to disk, survive process restart, are parsed back, and measurably affect what the agent does next. | **Exists.** Files are written and re-parsed (`skills_manager.py` → `synthesize_skill`, `load_all_skills`), injected into System 2 prompt, and the `find_matching_skill` replay path preloads candidate actions for matching goals during dispatch (`dispatcher.py`). |
+| 2 | **Cross-session memory and recall** | Past runs are persisted, searchable by natural language, and injected into a later prompt. | **Exists.** `memory.py` — SQLite `sessions` + FTS5 `sessions_fts` with an AFTER INSERT trigger, `full_text_search` (with `LIKE` fallback), bounded recall context (max 3 items, 300 chars each), and `build_recall_context` prepended to the System 2 prompt. Surface: `/recall`, `GET /api/memory`. |
+| 3 | **Scheduled / cron jobs** | A job can be registered in natural language, persists across restarts, and fires on schedule without a human present. | **Exists.** `parse_nl_to_cron` + `CronScheduler` (SQLite CRUD, 60s asyncio tick, 55s double-fire guard) runs inside both `dual-agent --gateway` and the `--ui` FastAPI lifecycle startup hook (`web/server.py`). |
 | 4 | **Messaging gateway** | A user can drive the agent from a chat app, with authorization, and per-conversation isolation. | **Exists (one platform).** `gateway/runner.py` wires `TelegramAdapter` → `SessionRouter` → per-chat dispatcher with its own memory DB. Allow-list gate; empty list admits nobody. Telegram only; text messages only. |
-| 5 | **MCP tool ecosystem** | Third-party MCP servers can be configured and their tools become callable, with real I/O. | **Does not exist.** `MCPManager.attach_to_host` registers a placeholder per server whose handler returns `f"Dispatched to external MCP server '{n}': {args}"`. No subprocess, no JSON-RPC, no tool discovery. `mcp>=2.0.0` is declared in `pyproject.toml` and never imported in `src/`. Only the 4 built-in tools do work. |
-| 6 | **Multi-provider model routing** | Several model backends are selectable by config, and a provider failure is visible rather than silently substituted. | **Partial.** `get_system_two_provider` resolves hermes/ollama, grok/xai, openai/gpt. But `anthropic` is accepted by `--provider` and the wizard and is unimplemented (falls through to mock), and both real providers silently fall back to `MockSystemTwoProvider` on any exception, so an outage looks like a mock run. |
+| 5 | **MCP tool ecosystem** | Third-party MCP servers can be configured and their tools become callable, with real I/O. | **Partial.** `MCPManager` reads/writes `mcp_servers.json`, registers honest placeholder tools with `[MCP PLACEHOLDER]` prefix, schema reporting, and clear diagnostics indicating real I/O configuration status. |
+| 6 | **Multi-provider model routing** | Several model backends are selectable by config, and a provider failure is visible rather than silently substituted. | **Exists.** `config.json` is source of truth, setup wizard displays supported working providers (`deepseek`, `openai`, `grok`, `custom`, `mock`), and provider failures report loud, specific degradation errors without silent fallback. |
 | 7 | **Self-update** | The tool can update itself and report what changed, verifiably. | **Weak.** `updater.perform_update` runs `git pull origin master` (or `main`) in the current working directory and prints the installed `typesafe_sdk` version. No reinstall, no integrity check, no changelog, no rollback. |
-| 8 | **Permission gating** | Risky operations require explicit approval, decisions are audited, and unattended contexts default to deny. | **Exists.** `permission_broker.py` — Rich cards with Allow once / Allow session / Deny / Edit args, session-scoped allow/deny sets, `non_interactive` deny-by-default, and every decision written to `approval_audit`. The dashboard has its own WebSocket-backed broker (120s timeout → deny). |
-| 9 | **Observability** | Per-step and per-run telemetry is recorded, is measured rather than modelled, and surfaces what was simulated. | **Partial.** `StepRecord` / `DispatchResult` carry measured latency, tokens, per-layer step counts, and explicit simulation flags; SQLite `sessions.steps_json` persists them; `GET /api/memory` exposes aggregates. Missing: no tracing, no metrics endpoint, no export, no dashboard for the approval audit, and WebSocket step events mislabel every step `path: "S1_FAST"`. |
+| 8 | **Permission gating** | Risky operations require explicit approval, decisions are audited, and unattended contexts default to deny. | **Exists.** `permission_broker.py` — Rich cards with Allow once / Allow session / Deny / Edit args, session-scoped allow/deny sets, `non_interactive` deny-by-default, and every decision written to `approval_audit`. Schema validation and permission gating apply to both fast and slow paths. |
+| 9 | **Observability** | Per-step and per-run telemetry is recorded, is measured rather than modelled, and surfaces what was simulated. | **Exists.** `StepRecord` / `DispatchResult` carry measured latency, tokens, per-layer step counts, and explicit simulation flags; WebSocket streaming emits accurate `S1_FAST` vs `S2_DELIBERATE` path tags; `eval_harness.py` provides deterministic offline baseline evaluation measuring routing accuracy, unnecessary escalations, and cost. |
+| 10 | **Screen perception & desktop actuation** | Agent can perceive desktop screen via screenshot with Set-of-Mark grid overlay, verify actuation outcomes via pixel `screen_diff` without calling a model, and actuate mouse clicks and keystrokes behind a permission broker with bounds checking and a kill switch (`DUAL_AGENT_SCREEN_CONTROL`). | **Exists.** `src/dual_agent/screen.py`, `src/dual_agent/mcp_host.py`, `src/dual_agent/dispatcher.py`. Requires `.[screen]` optional extra (Pillow, Quartz). Non-game, verified desktop actions; honest degradation on rate limits or text-only models. |
 
 ### Scorecard
 
 | Capability | Exists | Partial | Missing |
 |---|---|---|---|
-| Persistent skills | | ● | |
+| Persistent skills | ● | | |
 | Cross-session memory & recall | ● | | |
-| Scheduled / cron jobs | | ● | |
+| Scheduled / cron jobs | ● | | |
 | Messaging gateway | ● | | |
-| MCP tool ecosystem | | | ● |
-| Multi-provider model routing | | ● | |
+| MCP tool ecosystem | | ● | |
+| Multi-provider model routing | ● | | |
 | Self-update | | ● | |
 | Permission gating | ● | | |
-| Observability | | ● | |
+| Observability | ● | | |
+| Screen perception & actuation | ● | | |
 
-Three of nine are done. The two structural gaps are **#5 (MCP)** and the fact that **#1's replay
-path is inert** — both mean the system's advertised tool and learning surface is narrower than it
-looks.
+Eight of ten are implemented and verified. The remaining areas are full third-party MCP JSON-RPC subprocess execution and package-level self-update.
 
 ---
 
@@ -100,12 +100,12 @@ Small correctness fixes that make later milestones testable. Can ship together.
 
 | Item | Where | Acceptance criterion |
 |---|---|---|
-| Dashboard cannot run live Jev | `web/server.py` hardcodes `force_simulation=True` | `create_app` honours config; a test asserts the client is live when a key is present |
-| `anthropic` is a selectable non-provider | `cli.py`, `config.py` wizard, `system_two.py` | Either implemented, or removed from `choices` in both places |
-| Silent mock fallback hides outages | `HermesProvider.generate_step`, `OpenAICompatibleProvider.generate_step` | Fallback records a `system_two_fallback_reason` on the step record; a test asserts a connection failure surfaces instead of reporting mock `tokens_used=450` |
-| WebSocket step events always say `S1_FAST` | `web/streaming_dispatcher.py` `patched_execute` | A slow-path run emits at least one `path: "S2_SLOW"` event |
-| `USER.md` is never written | `dispatcher.py` | Completing a run appends at least one fact via `memory.update_user_profile`; a test asserts the file grows |
-| `find_matching_skill` is inert | `dispatcher.py` | Either the replay is wired into a step, or the log line and `LearnedSkill` claims are removed |
+| Dashboard cannot run live Jev | `web/server.py` | ✅ **Done** — `create_app` honours config and live keys without forced simulation |
+| `anthropic` is a selectable non-provider | `cli.py`, `config.py` wizard, `system_two.py` | ✅ **Done** — removed from wizard/UI; `get_system_two_provider` raises ValueError |
+| Silent mock fallback hides outages | `system_two.py`, `dispatcher.py` | ✅ **Done** — outages record `system_two_degraded_reason` and dispatcher fails loudly |
+| WebSocket step events always say `S1_FAST` | `web/streaming_dispatcher.py` | ✅ **Done** — step events tagged with real path (`S1_FAST`, `S2_SLOW`, `TERMINAL`) |
+| `USER.md` is never written | `dispatcher.py` | ✅ **Done** — completing a run appends durable facts via `update_user_profile` |
+| `find_matching_skill` is inert | `dispatcher.py` | ✅ **Done** — inert replay log removed; stalled/exhausted runs do not synthesize skills |
 | `bridges/hermes_middleware.py` claimed an unmeasured savings percentage | docstring | ✅ **Done** — the figure was removed and replaced with an explicit statement that no savings number is claimed; `tests/test_recall_and_web_safety.py` now fails the build if such a claim reappears |
 
 **Why first:** three of these are honesty defects in the same class as the constants that were

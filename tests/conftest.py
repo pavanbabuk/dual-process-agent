@@ -37,6 +37,8 @@ os.environ["DUAL_AGENT_HOME"] = _session_home
 # that forgets force_simulation=True.
 for _secret in (
     "TYPESAFE_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "CUSTOM_LLM_API_KEY",
     "HERMES_API_KEY",
     "OPENAI_API_KEY",
     "GROK_API_KEY",

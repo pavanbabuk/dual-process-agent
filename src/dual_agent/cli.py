@@ -13,6 +13,7 @@ from dual_agent.dispatcher import DualProcessDispatcher, DispatchResult
 from dual_agent.system_two import get_system_two_provider
 from dual_agent.typesafe_client import JevSystemOneClient
 from dual_agent.config import load_config, run_configuration_wizard
+from dual_agent import __version__
 
 console = Console()
 
@@ -123,7 +124,8 @@ USAGE
   dual-agent                                    Interactive shell (no arguments)
   dual-agent --goal "..." [options]             Run one goal
   dual-agent "..." [options]                    Run one goal (positional form)
-  dual-agent ui [--port=7860] [--no-browser]    Web dashboard (loopback only)
+  dual-agent app                                Native desktop application (WebKit window)
+  dual-agent ui [--port=7860] [--no-browser]    Web dashboard (browser)
   dual-agent gateway [--max-steps=N]            Telegram bot + cron scheduler daemon
   dual-agent config                             Configuration wizard
   dual-agent update                             Self-update from git
@@ -133,6 +135,7 @@ OPTIONS for a single goal
   --provider NAME            System 2 provider: mock | hermes | grok | openai
   --threshold FLOAT          System 1 confidence needed to trust the fast path
   --max-steps INT            Step budget (default 10)
+  --version                  Show the Dual-Process Agent version and exit
 
 ENVIRONMENT
   DUAL_AGENT_HOME                 Data dir. Default ~/.dual_agent.
@@ -152,6 +155,10 @@ ENVIRONMENT
   DUAL_AGENT_AUTO_ALLOW_PERMISSIONS=true   Skip approval prompts. Required for
                                            unattended use (gateway), where there
                                            is no terminal to answer them.
+  DUAL_AGENT_SCREEN_CONTROL=0              Kill switch: disable all mouse and
+                                           keyboard actuation.
+  DUAL_AGENT_SCREEN_LOOP=1                 Enable screen perception loop.
+  VISION_PROVIDER                          openai | grok | custom (paid/local VLM)
   DUAL_AGENT_UI_FORCE_SIMULATION=true      Keep the dashboard on the offline stub.
   DUAL_AGENT_UI_ALLOW_PUBLIC_BIND=true     Allow a non-loopback dashboard bind.
   TELEGRAM_BOT_TOKEN                       Required by `gateway`.
@@ -194,6 +201,22 @@ def main():
     if sys.argv[1].lower() in ("update", "--update"):
         from dual_agent.updater import perform_update
         perform_update()
+        return
+
+    # If first argument is 'app' or 'desktop', launch the native desktop application
+    if sys.argv[1].lower() in ("app", "--app", "desktop", "--desktop"):
+        if any(h in sys.argv[2:] for h in ("--help", "-h", "help")):
+            console.print("Usage: dual-agent app [--port=PORT]\n\nLaunch native standalone desktop application.")
+            return
+        port = None
+        for arg in sys.argv[2:]:
+            if arg.startswith("--port="):
+                try:
+                    port = int(arg.split("=", 1)[1])
+                except ValueError:
+                    pass
+        from dual_agent.app import run_desktop_app
+        run_desktop_app(port=port)
         return
 
     # If first argument is '--ui', launch the web dashboard
@@ -281,6 +304,12 @@ def main():
         type=int,
         default=10,
         help="Maximum agent steps before forcing completion.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"dual-agent {__version__}",
+        help="Show the Dual-Process Agent version and exit.",
     )
 
     args = parser.parse_args()

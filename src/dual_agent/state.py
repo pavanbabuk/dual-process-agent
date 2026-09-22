@@ -38,11 +38,22 @@ class StepRecord(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class PlanStep(BaseModel):
+    """An individual step in a decomposed execution plan."""
+    step_id: int
+    description: str
+    target_tool: Optional[str] = None
+    completed: bool = False
+    verified: bool = False
+    verification_notes: Optional[str] = None
+
+
 class AgentState(BaseModel):
     """Current state and execution history of the agent."""
     goal: str
     variables: Dict[str, Any] = Field(default_factory=dict)
     history: List[StepRecord] = Field(default_factory=list)
+    plan: List[PlanStep] = Field(default_factory=list)
     is_completed: bool = False
     final_output: Optional[str] = None
     max_steps: int = 20
@@ -76,10 +87,19 @@ class AgentState(BaseModel):
         for s in self.history[-5:]:
             recent_actions.append(f"Step {s.step_index}: {s.action} -> {str(s.output)[:120]}")
         history_summary = " | ".join(recent_actions) if recent_actions else "No prior actions."
+        
+        plan_summary = ""
+        if self.plan:
+            steps_desc = [
+                f"[{'x' if p.completed else ' '}] {p.step_id}. {p.description}"
+                for p in self.plan
+            ]
+            plan_summary = f"\nPLAN: {' | '.join(steps_desc)}"
+
         return (
             f"GOAL: {self.goal}\n"
             f"CURRENT STEP: {self.step_count + 1}/{self.max_steps}\n"
-            f"RECENT ACTIONS: {history_summary}\n"
+            f"RECENT ACTIONS: {history_summary}{plan_summary}\n"
             f"VARIABLES: {list(self.variables.keys())}"
         )
 
@@ -93,12 +113,18 @@ class AgentState(BaseModel):
         history_lines = []
         # Only the most recent steps are relevant to the next decision, and older
         # ones are what blow up the prompt.
-        for s in self.history[-MAX_HISTORY_STEPS_IN_PROMPT:]:
+        recent_steps = self.history[-MAX_HISTORY_STEPS_IN_PROMPT:]
+        for idx, s in enumerate(recent_steps):
             output = str(s.output)
-            if len(output) > MAX_OUTPUT_CHARS_PER_STEP:
-                omitted = len(output) - MAX_OUTPUT_CHARS_PER_STEP
+            # The most recent step's output is directly relevant to what the model
+            # is about to decide/do (e.g. read_file or search results). Give it
+            # up to 4000 chars so code sections aren't blinded, while older steps
+            # are kept tight to MAX_OUTPUT_CHARS_PER_STEP.
+            max_chars = 4000 if (idx == len(recent_steps) - 1) else MAX_OUTPUT_CHARS_PER_STEP
+            if len(output) > max_chars:
+                omitted = len(output) - max_chars
                 output = (
-                    output[:MAX_OUTPUT_CHARS_PER_STEP]
+                    output[:max_chars]
                     + f"\n...[truncated {omitted} chars]"
                 )
             history_lines.append(
@@ -113,12 +139,29 @@ class AgentState(BaseModel):
                 + history_text
             )
 
+        plan_section = ""
+        if self.plan:
+            plan_lines = []
+            for p in self.plan:
+                status = "COMPLETED" if p.completed else ("VERIFIED" if p.verified else "PENDING")
+                plan_lines.append(f"  {p.step_id}. [{status}] {p.description}")
+            plan_section = f"EXECUTION PLAN:\n" + "\n".join(plan_lines) + "\n\n"
+
+        remaining = max(0, self.max_steps - len(self.history))
         return (
             f"You are the System 2 Reasoning Engine in a Dual-Process Agent architecture.\n"
-            f"The fast reflex router (System 1) encountered a step requiring creative generation, code synthesis, or ambiguous reasoning.\n\n"
-            f"GOAL: {self.goal}\n\n"
+            f"The fast reflex router (System 1) encountered a step requiring deliberate tool execution or code synthesis.\n\n"
+            f"GOAL: {self.goal}\n"
+            f"STEP BUDGET: {remaining} step(s) remaining out of {self.max_steps}.\n\n"
+            f"{plan_section}"
             f"EXECUTION HISTORY (most recent {MAX_HISTORY_STEPS_IN_PROMPT} steps):\n{history_text}\n\n"
             f"AVAILABLE MCP TOOLS:\n{available_tools_desc}\n\n"
-            f"Please provide your reasoning and the next concrete tool call or final synthesis in JSON format:\n"
-            f"{{\"thought\": \"<reasoning>\", \"action\": \"<tool_name_or_finish>\", \"args\": {{...}}}}"
+            f"CRITICAL INSTRUCTIONS:\n"
+            f"1. Keep 'thought' concise (1 to 2 sentences). State your immediate concrete action.\n"
+            f"2. Use 'search_file' to locate target code/symbols (e.g. parser, imports, version) directly instead of re-reading large files.\n"
+            f"3. Use 'patch_file' to apply surgical changes.\n"
+            f"4. Verify your edits with 'run_shell_command' (e.g. python -m py_compile <file>).\n"
+            f"5. Once verified, immediately conclude with action 'finish_task'.\n"
+            f"6. Always output strictly valid JSON matching this schema:\n"
+            f'{{"thought": "<concise reasoning>", "action": "<mcp_tool_name>", "args": {{...}}}}\n'
         )

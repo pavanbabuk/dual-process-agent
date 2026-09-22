@@ -17,21 +17,45 @@ class AgentConfig(BaseModel):
     typesafe_base_url: str = "https://api.typesafe.ai"
     system_two_provider: str = "mock"
     system_one_confidence_threshold: float = 0.85
-    
+
+    # DeepSeek Provider
+    deepseek_api_key: Optional[str] = None
+    deepseek_model: str = "deepseek-chat"
+
     # Provider-specific keys & endpoints
     grok_api_key: Optional[str] = None
     grok_model: str = "grok-2-latest"
     anthropic_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
-    hermes_base_url: str = "http://localhost:11434/v1"
-    hermes_model: str = "nous-hermes-3-llama-3.1-8b"
-    # Needed for hosted OpenAI-compatible gateways (OmniRoute, OpenRouter, a
-    # remote vLLM). Local Ollama/vLLM needs no key, so this stays optional.
+
+    # Custom / Local OpenAI-compatible LLM endpoint
+    custom_llm_base_url: str = "http://localhost:11434/v1"
+    custom_llm_model: str = "llama3.1"
+    custom_llm_api_key: Optional[str] = None
+
+    # Backward compatibility aliases for existing config files
+    hermes_base_url: Optional[str] = None
+    hermes_model: Optional[str] = None
     hermes_api_key: Optional[str] = None
-    
+
     # User / workspace preferences
     auto_learn_skills: bool = True
     auto_scan_workspace: bool = True
+
+    # Vision Provider (paid/local VLM for screen control)
+    vision_provider: Optional[str] = None
+    vision_model: Optional[str] = None
+    vision_base_url: Optional[str] = None
+    vision_api_key: Optional[str] = None
+
+    def model_post_init(self, __context: Any) -> None:
+        """Sync backward-compatible hermes_* fields with custom_llm_* fields."""
+        if self.hermes_base_url and not self.custom_llm_base_url:
+            self.custom_llm_base_url = self.hermes_base_url
+        if self.hermes_model and not self.custom_llm_model:
+            self.custom_llm_model = self.hermes_model
+        if self.hermes_api_key and not self.custom_llm_api_key:
+            self.custom_llm_api_key = self.hermes_api_key
 
 
 def get_config_file_path() -> str:
@@ -46,17 +70,15 @@ def _candidate_env_files() -> List[str]:
     ]
 
 
+_LOADED_FROM_ENV_FILE: set[str] = set()
+
+
 def load_env_files() -> List[str]:
     """Load KEY=VALUE pairs from `.env` files into os.environ.
 
-    The README and install.sh both instruct users to put credentials in a `.env`
-    file, but nothing ever read one — no dotenv dependency, no parser. Following
-    the documented setup silently left the agent in simulation mode with no
-    error and no warning, so it looked like it worked while never contacting
-    Jev at all.
-
-    Real environment variables always win: an exported key is never clobbered by
-    a stale file, so `TYPESAFE_API_KEY=... dual-agent` still overrides .env.
+    Returns the list of .env paths that were loaded. Keys populated from these
+    files are recorded in _LOADED_FROM_ENV_FILE so load_config() knows they are
+    defaults that must not override explicit config.json values.
     """
     loaded: List[str] = []
     for path in _candidate_env_files():
@@ -70,24 +92,27 @@ def load_env_files() -> List[str]:
                         continue
                     key, _, value = line.partition("=")
                     key = key.strip()
-                    # Strip surrounding quotes and trailing inline comments.
                     value = value.strip()
                     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                         value = value[1:-1]
                     if key and key not in os.environ:
                         os.environ[key] = value
+                        _LOADED_FROM_ENV_FILE.add(key)
             loaded.append(path)
         except Exception as e:
             logger.warning(f"Could not read env file {path}: {e}")
-    if loaded:
-        logger.debug(f"Loaded environment from: {', '.join(loaded)}")
     return loaded
 
 
 def load_config() -> AgentConfig:
-    """Loads configuration from ~/.dual_agent/config.json, with fallback to environment variables."""
-    # Read .env first: it is the setup path the docs describe, and without this
-    # the documented flow silently configures nothing.
+    """Loads configuration from ~/.dual_agent/config.json, with fallback to environment variables.
+
+    Hierarchy:
+      1. Explicit shell environment variables (os.environ, not from .env file)
+      2. config.json (primary source of truth for saved settings)
+      3. .env file defaults
+      4. Hardcoded code defaults
+    """
     load_env_files()
 
     cfg_path = get_config_file_path()
@@ -100,49 +125,70 @@ def load_config() -> AgentConfig:
         except Exception as e:
             logger.warning(f"Error reading {cfg_path}: {e}")
 
-    # Fallback to current environment variables
-    env_typesafe = os.getenv("TYPESAFE_API_KEY")
-    if env_typesafe and not data.get("typesafe_api_key"):
-        data["typesafe_api_key"] = env_typesafe
+    # Synchronize legacy hermes_* keys into custom_llm_* if custom_llm_* is not explicitly set
+    if "hermes_base_url" in data and "custom_llm_base_url" not in data:
+        data["custom_llm_base_url"] = data["hermes_base_url"]
+    if "hermes_model" in data and "custom_llm_model" not in data:
+        data["custom_llm_model"] = data["hermes_model"]
+    if "hermes_api_key" in data and "custom_llm_api_key" not in data:
+        data["custom_llm_api_key"] = data["hermes_api_key"]
 
-    env_provider = os.getenv("SYSTEM_TWO_PROVIDER")
-    if env_provider and not data.get("system_two_provider"):
-        data["system_two_provider"] = env_provider
+    def _resolve(key: str, env_var: str, default: Any = None) -> Any:
+        # 1. Shell environment variable (present in os.environ and not from .env file)
+        if env_var in os.environ and env_var not in _LOADED_FROM_ENV_FILE:
+            return os.environ[env_var]
+        # 2. config.json
+        if key in data and data[key] is not None and data[key] != "":
+            return data[key]
+        # 3. .env file default (or fallback env)
+        if env_var in os.environ:
+            return os.environ[env_var]
+        # 4. Code default
+        return data.get(key, default)
 
-    env_grok = os.getenv("GROK_API_KEY")
-    if env_grok and not data.get("grok_api_key"):
-        data["grok_api_key"] = env_grok
+    resolved: Dict[str, Any] = {
+        "typesafe_api_key": _resolve("typesafe_api_key", "TYPESAFE_API_KEY", None),
+        "typesafe_base_url": _resolve("typesafe_base_url", "TYPESAFE_BASE_URL", "https://api.typesafe.ai"),
+        "system_two_provider": _resolve("system_two_provider", "SYSTEM_TWO_PROVIDER", "mock"),
+        "system_one_confidence_threshold": float(_resolve("system_one_confidence_threshold", "SYSTEM_ONE_CONFIDENCE_THRESHOLD", 0.85)),
+        "deepseek_api_key": _resolve("deepseek_api_key", "DEEPSEEK_API_KEY", None),
+        "deepseek_model": _resolve("deepseek_model", "DEEPSEEK_MODEL", "deepseek-chat"),
+        "grok_api_key": _resolve("grok_api_key", "GROK_API_KEY", None),
+        "grok_model": _resolve("grok_model", "GROK_MODEL", "grok-2-latest"),
+        "openai_api_key": _resolve("openai_api_key", "OPENAI_API_KEY", None),
+        "anthropic_api_key": _resolve("anthropic_api_key", "ANTHROPIC_API_KEY", None),
+        "custom_llm_base_url": (
+            _resolve("custom_llm_base_url", "CUSTOM_LLM_BASE_URL", None)
+            or _resolve("hermes_base_url", "HERMES_BASE_URL", "http://localhost:11434/v1")
+        ),
+        "custom_llm_model": (
+            _resolve("custom_llm_model", "CUSTOM_LLM_MODEL", None)
+            or _resolve("hermes_model", "HERMES_MODEL", "llama3.1")
+        ),
+        "custom_llm_api_key": (
+            _resolve("custom_llm_api_key", "CUSTOM_LLM_API_KEY", None)
+            or _resolve("hermes_api_key", "HERMES_API_KEY", None)
+        ),
+        "vision_provider": _resolve("vision_provider", "VISION_PROVIDER", None),
+        "vision_model": _resolve("vision_model", "VISION_MODEL", None),
+        "vision_base_url": _resolve("vision_base_url", "VISION_BASE_URL", None),
+        "vision_api_key": _resolve("vision_api_key", "VISION_API_KEY", None),
+        "auto_learn_skills": bool(data.get("auto_learn_skills", True)),
+        "auto_scan_workspace": bool(data.get("auto_scan_workspace", True)),
+    }
 
-    env_openai = os.getenv("OPENAI_API_KEY")
-    if env_openai and not data.get("openai_api_key"):
-        data["openai_api_key"] = env_openai
+    config = AgentConfig(**resolved)
 
-    env_anthropic = os.getenv("ANTHROPIC_API_KEY")
-    if env_anthropic and not data.get("anthropic_api_key"):
-        data["anthropic_api_key"] = env_anthropic
-
-    env_hermes = os.getenv("HERMES_API_KEY")
-    if env_hermes and not data.get("hermes_api_key"):
-        data["hermes_api_key"] = env_hermes
-    env_hermes_url = os.getenv("HERMES_BASE_URL")
-    if env_hermes_url:
-        data["hermes_base_url"] = env_hermes_url
-    env_hermes_model = os.getenv("HERMES_MODEL")
-    if env_hermes_model:
-        data["hermes_model"] = env_hermes_model
-
-    config = AgentConfig(**data)
-
-    # Export resolved provider settings back into the environment.
-    #
-    # The System 2 providers read os.environ directly (see system_two.py), so
-    # without this the values a user saves via `dual-agent config` were parsed,
-    # stored and then silently ignored — the provider kept using its defaults and
-    # usually fell back to the mock. Real environment variables still take
-    # precedence, so a shell export always overrides the config file.
-    _export_if_absent("HERMES_BASE_URL", config.hermes_base_url)
-    _export_if_absent("HERMES_MODEL", config.hermes_model)
-    _export_if_absent("HERMES_API_KEY", config.hermes_api_key)
+    # Export resolved values back into env if not already set, so subprocesses / adapters see them
+    _export_if_absent("TYPESAFE_API_KEY", config.typesafe_api_key)
+    _export_if_absent("DEEPSEEK_API_KEY", config.deepseek_api_key)
+    _export_if_absent("DEEPSEEK_MODEL", config.deepseek_model)
+    _export_if_absent("CUSTOM_LLM_BASE_URL", config.custom_llm_base_url)
+    _export_if_absent("CUSTOM_LLM_MODEL", config.custom_llm_model)
+    _export_if_absent("CUSTOM_LLM_API_KEY", config.custom_llm_api_key)
+    _export_if_absent("HERMES_BASE_URL", config.custom_llm_base_url)
+    _export_if_absent("HERMES_MODEL", config.custom_llm_model)
+    _export_if_absent("HERMES_API_KEY", config.custom_llm_api_key)
 
     return config
 
@@ -188,34 +234,34 @@ def run_configuration_wizard() -> AgentConfig:
     # 2. System 2 Provider
     provider = Prompt.ask(
         "[bold yellow]Select System 2 Reasoner Provider[/bold yellow]",
-        choices=["mock", "hermes", "grok", "anthropic", "openai"],
+        choices=["mock", "deepseek", "grok", "openai", "custom"],
         default=current.system_two_provider,
     )
     current.system_two_provider = provider
 
     # 3. Provider-specific keys
-    if provider == "grok":
+    if provider == "deepseek":
+        key = Prompt.ask("DeepSeek API Key (from https://platform.deepseek.com)", default=current.deepseek_api_key or "")
+        current.deepseek_api_key = key.strip()
+        model = Prompt.ask("DeepSeek Model (deepseek-chat or deepseek-reasoner)", default=current.deepseek_model)
+        current.deepseek_model = model.strip()
+    elif provider == "grok":
         key = Prompt.ask("xAI Grok API Key", default=current.grok_api_key or "")
         current.grok_api_key = key.strip()
-    elif provider == "anthropic":
-        key = Prompt.ask("Anthropic API Key", default=current.anthropic_api_key or "")
-        current.anthropic_api_key = key.strip()
     elif provider == "openai":
         key = Prompt.ask("OpenAI API Key", default=current.openai_api_key or "")
         current.openai_api_key = key.strip()
-    elif provider == "hermes":
-        url = Prompt.ask("Hermes Ollama/vLLM Base URL", default=current.hermes_base_url)
-        current.hermes_base_url = url.strip()
-        model = Prompt.ask("Model name", default=current.hermes_model)
-        current.hermes_model = model.strip()
-        # Optional: only hosted gateways need this. Blank is correct for a local
-        # server, which is why it is not a required prompt.
+    elif provider in ("custom", "hermes"):
+        url = Prompt.ask("Local LLM Base URL (Ollama / vLLM)", default=current.custom_llm_base_url)
+        current.custom_llm_base_url = url.strip()
+        model = Prompt.ask("Model name", default=current.custom_llm_model)
+        current.custom_llm_model = model.strip()
         key = Prompt.ask(
-            "API key (blank for a local server)",
-            default=current.hermes_api_key or "",
+            "API key (blank for local server)",
+            default=current.custom_llm_api_key or "",
             password=True,
         )
-        current.hermes_api_key = key.strip()
+        current.custom_llm_api_key = key.strip()
 
     # 4. Save
     saved_path = save_config(current)

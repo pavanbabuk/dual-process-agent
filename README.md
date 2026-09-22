@@ -1,48 +1,30 @@
-# Dual-Process Agent v2.0 (Turnkey AI Assistant)
+# Dual-Process Agent (`dual-agent`)
 
-A high-performance **Turnkey AI Assistant** combining **TypeSafe AI's Jev** (System 1) with **Model Context Protocol (MCP)** tools, **System 2 LLMs** (Nous Research Hermes, xAI Grok, Anthropic Claude, OpenAI), **Persistent SQLite Memory**, **Self-Improving Skills**, **FTS5 Cross-Session Recall**, **Interactive Permission Cards**, **Telegram Gateway**, and **Cron Scheduler**.
+A high-performance **Turnkey AI Assistant** combining **TypeSafe AI's Jev** (System 1) with **Model Context Protocol (MCP)** tools, **System 2 LLMs** (DeepSeek V3/R1, xAI Grok, OpenAI, Local Ollama/vLLM), **Persistent SQLite Memory**, **Self-Improving Skills**, **FTS5 Cross-Session Recall**, **Interactive Permission Cards**, **Telegram Gateway**, and **Cron Scheduler**.
 
----
-
-## Quick Install (Hermes-style one-liner)
-
-### Linux, macOS, WSL2
-
-```bash
-bash install.sh
-```
-
-Or as a one-liner after hosting:
-```bash
-curl -fsSL https://your-host/install.sh | bash
-```
-
-Then:
-```bash
-source ~/.zshrc      # or ~/.bashrc
-dual-agent config    # enter your API keys
-dual-agent           # start chatting!
-```
-
-### Manual (existing workflow)
-
-```bash
-git clone https://github.com/pavanbabuk/dual-process-agent.git
-cd dual-process-agent
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-dual-agent config
-dual-agent
-```
+> **Architecture:** Sub-20ms reflex routing (System 1) handles deterministic tool execution. Complex reasoning escalates to System 2 LLMs only when needed.
 
 ---
 
-## The Dual-Process Advantage
+## Quick Install (One-Liner)
 
-Traditional agents use a heavy generative LLM for every decision. **Dual-Process Agent** splits execution:
+```bash
+curl -fsSL https://raw.githubusercontent.com/pavanbabuk/dual-process-agent/master/install.sh | bash
+```
+*(Or install locally with `pip install -e .[all]`)*
 
-1. **⚡ System 1 (TypeSafe AI Jev):** Reflex engine that routes tools and checks safety — **0 generated tokens per decision.**
-2. **🧠 System 2 (Hermes, Grok, Claude):** Deliberate reasoner invoked only when creative synthesis or complex reasoning is needed.
+---
+
+## Key Features
+
+1. **⚡ System 1 Reflex Engine (TypeSafe AI Jev):** Evaluates goals sub-20ms. Runs fast-path tool execution without waiting for LLM generation.
+2. **🧠 System 2 Reasoner (DeepSeek V3/R1, Grok, OpenAI, Custom LLM):** Deliberate reasoner invoked only when creative synthesis or complex reasoning is needed. Includes chain-of-thought extraction for DeepSeek R1.
+3. **⚙ Live Web UI & Settings Dashboard:** Launch with `dual-agent --ui` at `http://localhost:7860` to configure API keys, switch models live, and view real-time execution step traces.
+4. **🔐 Interactive Permission Broker:** Renders inline approval cards in terminal and Web UI (`[Allow Once] [Allow Session] [Deny] [Edit]`).
+5. **📚 Autonomous Skill Synthesis:** Synthesizes portable `.SKILL.md` files after every successful task execution.
+6. **🔍 FTS5 Cross-Session Memory:** Full-text search over past sessions and automatically updated `USER.md` profile.
+7. **⏰ Natural Language Scheduler:** Natural language cron scheduling (e.g. `/schedule "every day at 9am"`).
+8. **🌐 Omni-Channel Gateway:** Background daemon for Telegram integration (`dual-agent --gateway`).
 
 **On the performance claims.** Earlier revisions of this README advertised *"70–90% lower token costs, 4–80× faster responses"* and the CLI printed a matching `Traditional LLM Baseline` column. Those numbers were **not measured**: they came from multiplying the step count by hardcoded constants (1500 tokens / 1200 ms per step) and reporting the difference. That code is gone, because a benchmark you compute from a constant you chose is not a benchmark.
 
@@ -164,6 +146,35 @@ Running the gateway also starts the **scheduler daemon**, which is what actually
 **Risky tools are denied in gateway mode** unless you set `DUAL_AGENT_AUTO_ALLOW_PERMISSIONS=true`. There is no terminal behind a chat to answer an approval card, so `write_file` and `run_shell_command` are refused rather than permitted silently.
 
 Configuration is read from `.env` (checked at `~/.dual_agent/.env` and `./.env`); real environment variables take precedence over the file.
+
+---
+
+## Screen Control & Desktop Interaction
+
+Dual-Process Agent can perceive the graphical desktop and execute verified mouse and keyboard actions:
+
+```bash
+# Install screen control extra (Pillow + PyObjC Quartz)
+pip install "dual-agent[screen]"
+```
+
+### Perception & Actuation Tools
+- `screenshot`: Captures the display, dynamically calibrating the Retina scale factor (`capture_pixels / logical_points`, e.g. 1.336 or 2.0).
+- `grid_overlay`: Annotates screenshots with a labeled coordinate grid overlay (Set-of-Mark) to guide visual targeting.
+- `screen_diff`: Pixel-level visual difference comparison between screenshots. Fast, local, and requires no model calls.
+- `mouse_click`, `mouse_move`, `key_press`: Actuates clicks, moves, and keystrokes at logical coordinates. All actuation tools are classified as **HIGH RISK** and require approval via the `PermissionBroker`.
+
+### Safety & Permission Safeguards
+- **Emergency Kill Switch**: Set `DUAL_AGENT_SCREEN_CONTROL=0` to immediately disable all actuation tools.
+- **Single Checkpoint**: All actuation paths (fast-path reflexes and deliberate System 2 planning) pass through schema validation and permission broker gating.
+- **Physical Outcome Verification**: The agent never assumes an action succeeded from model assertions alone. `screen_diff` checks whether the screen physically changed; if no change is detected after a click, verification fails and auto-correction guidance is triggered.
+- **macOS Permissions**: Requires macOS Screen Recording permission (for display capture) and Accessibility permission (in System Settings -> Privacy & Security -> Accessibility) for sending input events.
+
+### Vision Models & Cost Prerequisite
+Text-only models (such as `deepseek-chat` or `deepseek-reasoner`) do not process images. To control visual screens, configure a multimodal vision model:
+- OpenAI (`gpt-4o`, `gpt-4o-mini`) via `OPENAI_API_KEY`
+- xAI Grok Vision (`grok-2-vision-1212`) via `GROK_API_KEY`
+- Local VLM (e.g. `llava`, `qwen2-vl` on Ollama/vLLM) via `VISION_PROVIDER=custom` and `CUSTOM_LLM_BASE_URL`
 
 ---
 

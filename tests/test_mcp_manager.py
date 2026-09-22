@@ -35,3 +35,21 @@ def test_mcp_manager_add_and_remove(tmp_path):
     removed = mgr.remove_server("github")
     assert removed is True
     assert "github" not in mgr.load_servers()
+
+
+def test_external_mcp_server_fails_loudly_when_called(tmp_path):
+    """Calling an external MCP server placeholder must fail loudly, not claim success."""
+    config_file = str(tmp_path / "mcp_servers.json")
+    mgr = MCPManager(config_path=config_file)
+    mgr.add_server(
+        name="test_ext",
+        command="external-cmd",
+        args=["arg1"],
+    )
+    host = MCPHost()
+    mgr.attach_to_host(host)
+
+    res = host.execute_tool("mcp_test_ext_dispatch", {"action": "list_repos"})
+    assert res.success is False
+    assert "not connected" in str(res.error).lower()
+    assert "not implemented" in str(res.error).lower()

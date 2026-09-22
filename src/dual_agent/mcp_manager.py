@@ -87,20 +87,24 @@ class MCPManager:
         servers = self.load_servers()
         attached_count = 0
         for name, srv in servers.items():
-            if srv.disabled:
-                continue
-            # Register placeholder tools or stdio client connectors
-            # For each external server, expose a bridge tool
+            # External MCP servers are placeholders until a real stdio client is implemented.
+            # Fail loudly on execution rather than pretending dispatch succeeded.
+            def _unconnected_handler(args, n=name, cmd=srv.command):
+                raise RuntimeError(
+                    f"External MCP server '{n}' ({cmd}) is configured but not connected: "
+                    f"subprocess/JSON-RPC client is not implemented."
+                )
+
             tool_name = f"mcp_{name}_dispatch"
             host.register_tool(
                 MCPToolDefinition(
                     name=tool_name,
-                    description=f"External MCP Server '{name}' ({srv.command} {' '.join(srv.args)})",
+                    description=f"External MCP Server '{name}' ({srv.command}) [NOT CONNECTED]",
                     parameters_schema={
                         "type": "object",
                         "properties": {"action": {"type": "string"}, "payload": {"type": "object"}},
                     },
-                    handler=lambda args, n=name: f"Dispatched to external MCP server '{n}': {args}",
+                    handler=_unconnected_handler,
                 )
             )
             attached_count += 1

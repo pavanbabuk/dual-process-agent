@@ -5,13 +5,14 @@ import os
 import re
 import time
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field
 
-from dual_agent.state import AgentState, StepRecord, StepType
+from dual_agent.state import AgentState, PlanStep, StepRecord, StepType
 from dual_agent.typesafe_client import JevSystemOneClient, JevDecision
 from dual_agent.mcp_host import MCPHost, ToolExecutionResult
 from dual_agent.system_two import SystemTwoProvider, get_system_two_provider
+from dual_agent.evaluator import JevEvaluator
 from dual_agent.memory import MemoryEngine, LearnedSkill
 from dual_agent.skills_manager import SkillsManager
 from dual_agent.permission_broker import PermissionBroker, ApprovalDecision
@@ -38,14 +39,23 @@ def validate_tool_args(tool, args: Dict[str, Any]) -> Tuple[bool, str]:
             return False, f"required argument '{name}' is missing or empty"
 
     for name, value in args.items():
-        if name in properties:
-            expected = properties[name].get("type")
-            if expected == "string" and not isinstance(value, str):
-                return False, f"argument '{name}' must be a string, got {type(value).__name__}"
-            if expected == "integer" and (isinstance(value, bool) or not isinstance(value, int)):
-                return False, f"argument '{name}' must be an integer, got {type(value).__name__}"
-            if expected == "boolean" and not isinstance(value, bool):
-                return False, f"argument '{name}' must be a boolean, got {type(value).__name__}"
+        if name not in properties:
+            # Reject unknown keys to prevent executing tools with hallucinated/unverified parameters.
+            return False, f"unknown argument '{name}' is not in tool schema"
+
+        expected = properties[name].get("type")
+        if expected == "string" and not isinstance(value, str):
+            return False, f"argument '{name}' must be a string, got {type(value).__name__}"
+        elif expected == "integer" and (isinstance(value, bool) or not isinstance(value, int)):
+            return False, f"argument '{name}' must be an integer, got {type(value).__name__}"
+        elif expected in ("number", "float") and (isinstance(value, bool) or not isinstance(value, (int, float))):
+            return False, f"argument '{name}' must be a number, got {type(value).__name__}"
+        elif expected == "boolean" and not isinstance(value, bool):
+            return False, f"argument '{name}' must be a boolean, got {type(value).__name__}"
+        elif expected in ("array", "list") and not isinstance(value, list):
+            return False, f"argument '{name}' must be a list/array, got {type(value).__name__}"
+        elif expected in ("object", "dict") and not isinstance(value, dict):
+            return False, f"argument '{name}' must be a dict/object, got {type(value).__name__}"
     return True, ""
 
 
@@ -83,6 +93,7 @@ class DispatchResult(BaseModel):
     # codebase has already been burned by (fabricated benchmark columns).
     system_two_is_mock: bool = False
     system_two_degraded_reason: Optional[str] = None
+    plan: List[PlanStep] = Field(default_factory=list)
 
 
 class DualProcessDispatcher:
@@ -96,13 +107,26 @@ class DualProcessDispatcher:
         memory_engine: Optional[MemoryEngine] = None,
         skills_manager: Optional[SkillsManager] = None,
         permission_broker: Optional[PermissionBroker] = None,
+        evaluator: Optional[JevEvaluator] = None,
         confidence_threshold: float = 0.85,
+        step_callback: Optional[Callable[[StepRecord], None]] = None,
+        config: Optional[Any] = None,
     ):
+        if config is not None:
+            self.config = config
+        else:
+            try:
+                from dual_agent.config import load_config
+                self.config = load_config()
+            except Exception:
+                self.config = None
         self.s1 = system_one_client or JevSystemOneClient()
-        self.s2 = system_two_provider or get_system_two_provider()
+        self.s2 = system_two_provider or get_system_two_provider(config=self.config)
         self.mcp = mcp_host or MCPHost()
+        self.evaluator = evaluator or JevEvaluator(self.s1)
         self.memory = memory_engine or MemoryEngine()
         self.skills = skills_manager or SkillsManager()
+        self.step_callback = step_callback
         # Auto-allow permissions in CI/non-interactive environments
         auto_allow = os.getenv("DUAL_AGENT_AUTO_ALLOW_PERMISSIONS", "false").lower() == "true"
         self.broker = permission_broker or PermissionBroker(
@@ -124,16 +148,180 @@ class DualProcessDispatcher:
         self._verification_clock_ms: float = 0.0
         self._pending_verification_latency_ms: float = 0.0
 
-    def run(self, goal: str, max_steps: int = 15) -> DispatchResult:
+    def _scan_workspace(self, workspace_path: str) -> None:
+        """Scan workspace for tech stack markers and persist to memory."""
+        try:
+            languages = []
+            features = {}
+            if os.path.exists(os.path.join(workspace_path, "pyproject.toml")) or os.path.exists(os.path.join(workspace_path, "setup.py")):
+                languages.append("python")
+                features["has_pyproject"] = True
+            if os.path.exists(os.path.join(workspace_path, "package.json")):
+                languages.append("javascript/typescript")
+                features["has_package_json"] = True
+            if os.path.exists(os.path.join(workspace_path, "Cargo.toml")):
+                languages.append("rust")
+                features["has_cargo"] = True
+            if os.path.exists(os.path.join(workspace_path, "go.mod")):
+                languages.append("go")
+                features["has_gomod"] = True
+
+            tech_stack = {"languages": languages, **features}
+            user_prefs = {"confidence_threshold": self.confidence_threshold}
+            self.memory.save_project_context(
+                workspace_path=workspace_path,
+                tech_stack=tech_stack,
+                user_preferences=user_prefs,
+            )
+        except Exception as e:
+            logger.debug(f"[Dispatcher] Workspace scan error: {e}")
+
+    def _record_step(
+        self,
+        state: AgentState,
+        record: StepRecord,
+        callback: Optional[Callable[[StepRecord], None]] = None,
+    ) -> None:
+        """Append step record to state history and notify callback if registered."""
+        state.history.append(record)
+        cb = callback or self.step_callback
+        if cb:
+            try:
+                cb(record)
+            except Exception as e:
+                logger.debug(f"[Dispatcher] step_callback error: {e}")
+
+    def _create_plan(self, goal: str, available_tools_desc: str) -> List[PlanStep]:
+        """Decompose a goal into concrete, sequential subgoals before execution."""
+        subgoals: List[str] = []
+        if self.s2 and not getattr(self.s2, "is_mock", False):
+            prompt = (
+                f"You are the Planning Engine in a Dual-Process Agent.\n"
+                f"Decompose the user's goal into an ordered sequence of 2 or 3 concise, actionable subgoals (inspect, patch, verify).\n"
+                f"GOAL: {goal}\n"
+                f"AVAILABLE TOOLS:\n{available_tools_desc}\n\n"
+                f"Respond with JSON only: {{\"thought\": \"planning\", \"action\": \"plan_subgoals\", \"args\": {{\"subgoals\": [\"<subgoal 1>\", \"<subgoal 2>\", ...]}}}}"
+            )
+            try:
+                resp = self.s2.generate_step(prompt)
+                if resp.action == "plan_subgoals" and "subgoals" in (resp.args or {}):
+                    subgoals = resp.args["subgoals"]
+                elif resp.generated_content:
+                    import json
+                    parsed = json.loads(resp.generated_content)
+                    if "subgoals" in parsed and isinstance(parsed["subgoals"], list):
+                        subgoals = parsed["subgoals"]
+                    elif "args" in parsed and "subgoals" in parsed["args"]:
+                        subgoals = parsed["args"]["subgoals"]
+                if not subgoals and (resp.args or {}).get("subgoals"):
+                    subgoals = resp.args["subgoals"]
+            except Exception as e:
+                logger.debug(f"[Dispatcher] System 2 planning fallback: {e}")
+
+        if not subgoals:
+            lower_g = goal.lower()
+            if any(conj in lower_g for conj in (" and ", " then ", " also ", "add ", "update ", "modify ", "document ")):
+                subgoals = [
+                    f"Inspect workspace and examine target files for '{goal[:40]}'",
+                    f"Perform requested modifications or patches for '{goal[:40]}'",
+                    f"Verify changes parse, import, and satisfy '{goal[:40]}'",
+                ]
+            else:
+                subgoals = [f"Execute task: {goal}"]
+
+        return [
+            PlanStep(step_id=idx + 1, description=desc)
+            for idx, desc in enumerate(subgoals)
+        ]
+
+    def _update_plan_progress(
+        self,
+        state: AgentState,
+        action: str,
+        is_verified: bool,
+        notes: str,
+    ) -> None:
+        """Update plan steps with execution outcome."""
+        if not state.plan:
+            return
+        active_step = next((p for p in state.plan if not p.completed), None)
+        if not active_step:
+            return
+
+        if not is_verified:
+            active_step.verification_notes = f"Verification failed: {notes}"
+            return
+
+        active_step.verification_notes = notes
+        desc = active_step.description.lower()
+        if any(w in desc for w in ("inspect", "read", "examine", "locate", "check", "find")):
+            if action in ("read_file", "list_directory", "run_shell_command"):
+                active_step.completed = True
+                active_step.verified = True
+        elif any(w in desc for w in ("modify", "patch", "write", "add", "update", "edit", "implement")):
+            if action in ("patch_file", "write_file", "run_shell_command"):
+                active_step.completed = True
+                active_step.verified = True
+        elif any(w in desc for w in ("verify", "test", "validate", "confirm")):
+            if action in ("run_shell_command", "read_file", "finish_task"):
+                active_step.completed = True
+                active_step.verified = True
+        else:
+            active_step.completed = True
+            active_step.verified = True
+
+    def _get_tool_confidence_threshold(self, tool_name: str) -> float:
+        """Derive confidence threshold per tool risk level (vendor spec alignment).
+
+        Destructive and file-modifying tools require higher confidence (>= 0.88 - 0.92)
+        and verification, while read-only / non-destructive inspection tools have a
+        lower threshold (~0.75).
+        """
+        tool_def = self.mcp.get_tool(tool_name)
+        if not tool_def:
+            return float(os.getenv("ACTION_CONFIDENCE_THRESHOLD_HIGH_RISK", "0.92"))
+
+        risk = (tool_def.risk_level or "").lower()
+        if risk == "high" or "destructive" in (tool_def.description or "").lower():
+            return float(os.getenv("ACTION_CONFIDENCE_THRESHOLD_HIGH_RISK", "0.92"))
+        elif risk == "medium" or tool_def.requires_approval or tool_name in ("write_file", "patch_file"):
+            return float(os.getenv("ACTION_CONFIDENCE_THRESHOLD_MEDIUM_RISK", "0.88"))
+        else:
+            # Low risk (read-only inspection, e.g. list_directory, read_file)
+            return float(os.getenv("ACTION_CONFIDENCE_THRESHOLD_LOW_RISK", "0.75"))
+
+    def run(
+        self,
+        goal: str,
+        max_steps: int = 15,
+        step_callback: Optional[Callable[[StepRecord], None]] = None,
+        enable_screen_loop: Optional[bool] = None,
+    ) -> DispatchResult:
         """Execute the agent loop for the given goal."""
         self._current_goal = goal
+        active_callback = step_callback or self.step_callback
         run_started_at = time.perf_counter()
+
+        if enable_screen_loop is None:
+            enable_screen_loop = any(
+                kw in goal.lower()
+                for kw in ("screen", "desktop", "click", "mouse", "window", "display", "gui", "screenshot", "type into")
+            ) or (os.environ.get("DUAL_AGENT_SCREEN_LOOP", "0").lower() in ("1", "true"))
         # Verification router calls are billed here as they happen; anything the
         # per-step records miss is reconciled against the wall clock at the end.
         self._verification_clock_ms = 0.0
         self._pending_verification_latency_ms = 0.0
         state = AgentState(goal=goal, max_steps=max_steps)
         tool_descriptions = self.mcp.get_tool_descriptions()
+
+        # --- WORKSPACE SCAN: discover project context if enabled ---
+        if getattr(self.config, "auto_scan_workspace", False):
+            self._scan_workspace(os.getcwd())
+
+        # --- GOAL DECOMPOSITION: create structured plan ---
+        state.plan = self._create_plan(goal, self.mcp.get_formatted_tool_list_for_system_two())
+        verification_failures: Dict[int, int] = {}
+        correction_guidance = ""
 
         # --- RECALL CONTEXT: inject past sessions matching this goal ---
         recall_ctx = self.memory.build_recall_context(goal, limit=3)
@@ -145,13 +333,8 @@ class DualProcessDispatcher:
         if skill_ctx:
             logger.debug(f"[Dispatcher] Injecting skill context ({len(skill_ctx)} chars)")
 
-        # Check for cached learned skills (SQLite fast-path replay)
-        cached_skill = self.memory.find_matching_skill(goal)
-        if cached_skill:
-            logger.info(
-                f"[Learned Skill Replay] Found cached routine '{cached_skill.name}' "
-                f"with tool sequence: {cached_skill.tool_sequence}"
-            )
+        # Note: self.memory.find_matching_skill is reserved for memory lookup;
+        # inert replay logging without actual execution skipping has been removed.
 
         s1_latency_total = 0.0
         s2_latency_total = 0.0
@@ -167,6 +350,7 @@ class DualProcessDispatcher:
         # steps end the run instead.
         last_signature = None
         repeat_count = 0
+        stalled = False
 
         # Surface simulation mode up front rather than only in logs — a run whose
         # "System 1" is the local stub must never be reported as a Jev run.
@@ -181,6 +365,26 @@ class DualProcessDispatcher:
             if state.is_completed:
                 break
 
+            # --- SCREEN PERCEPTION (when screen loop enabled) ---
+            step_screenshot_path: Optional[str] = None
+            step_grid_path: Optional[str] = None
+            if enable_screen_loop and self.mcp.get_tool("screenshot"):
+                try:
+                    ss_res = self.mcp.execute_tool("screenshot", {})
+                    if ss_res.success and ss_res.output:
+                        import json as _json
+                        ss_data = _json.loads(ss_res.output)
+                        step_screenshot_path = ss_data.get("path")
+                        if step_screenshot_path and self.mcp.get_tool("grid_overlay"):
+                            g_res = self.mcp.execute_tool("grid_overlay", {"image_path": step_screenshot_path})
+                            if g_res.success and g_res.output:
+                                g_data = _json.loads(g_res.output)
+                                step_grid_path = g_data.get("overlay_path")
+                except Exception as ss_e:
+                    logger.debug(f"[Dispatcher] Screen observation error: {ss_e}")
+
+            active_plan_step = next((p for p in state.plan if not p.completed), None)
+            current_subgoal = active_plan_step.description if active_plan_step else goal
             state_summary = state.to_system_one_state()
 
             # --- SYSTEM 1 REFLEX EVALUATION (~15ms) ---
@@ -198,20 +402,31 @@ class DualProcessDispatcher:
 
             # Check if Jev determined the task is already finished
             if decision.is_terminal or decision.selected_tool == "finish_task":
-                state.is_completed = True
-                state.final_output = state.final_output or "Goal satisfied successfully."
-                state.history.append(
-                    StepRecord(
-                        step_index=step_idx,
-                        step_type=StepType.TERMINATION,
-                        action="finish_task",
-                        output=state.final_output,
-                        confidence=decision.confidence,
-                        latency_ms=decision.latency_ms,
-                        tokens_used=0,
+                step_fail = verification_failures.get(active_plan_step.step_id if active_plan_step else 0, 0)
+                if step_fail == 0 and self.evaluator.check_task_completion(state):
+                    state.is_completed = True
+                    state.final_output = state.final_output or "Goal satisfied successfully."
+                    for p in state.plan:
+                        if not p.completed:
+                            p.completed = True
+                            p.verified = True
+                    self._record_step(
+                        state,
+                        StepRecord(
+                            step_index=step_idx,
+                            step_type=StepType.TERMINATION,
+                            action="finish_task",
+                            output=state.final_output,
+                            confidence=decision.confidence,
+                            latency_ms=decision.latency_ms,
+                            tokens_used=0,
+                        ),
+                        active_callback,
                     )
-                )
-                break
+                    break
+                else:
+                    # Incomplete or failed verification; terminal reflex was premature
+                    decision.needs_generation = True
 
             # --- ROUTING DECISION: Fast-path (System 1) vs Slow-path (System 2) ---
             # Assigned only on the fast path; pre-declared so a rejected fast path
@@ -220,14 +435,14 @@ class DualProcessDispatcher:
             default_args: Dict[str, Any] = {}
             fast_path_confidence = self._compute_fast_path_confidence(decision, state)
 
+            tool_threshold = self._get_tool_confidence_threshold(decision.selected_tool)
             can_use_fast_path = (
-                fast_path_confidence >= self.confidence_threshold
+                fast_path_confidence >= tool_threshold
                 and not decision.needs_generation
                 and decision.selected_tool in tool_descriptions
             )
 
             if can_use_fast_path:
-                # FAST PATH: Execute MCP tool directly without waking System 2
                 tool_name = decision.selected_tool
                 default_args = self._infer_default_args(tool_name, state)
 
@@ -266,7 +481,8 @@ class DualProcessDispatcher:
                         risk_level=tool_def.risk_level,
                     )
                     if approval == ApprovalDecision.DENY:
-                        state.history.append(
+                        self._record_step(
+                            state,
                             StepRecord(
                                 step_index=step_idx,
                                 step_type=StepType.SYSTEM_ONE_FAST_TOOL,
@@ -276,7 +492,8 @@ class DualProcessDispatcher:
                                 confidence=decision.confidence,
                                 latency_ms=decision.latency_ms,
                                 tokens_used=0,
-                            )
+                            ),
+                            active_callback,
                         )
                         continue
 
@@ -285,7 +502,8 @@ class DualProcessDispatcher:
                 s1_latency_total += exec_result.execution_time_ms
 
                 output_val = exec_result.output if exec_result.success else exec_result.error
-                state.history.append(
+                self._record_step(
+                    state,
                     StepRecord(
                         step_index=step_idx,
                         step_type=StepType.SYSTEM_ONE_FAST_TOOL,
@@ -296,13 +514,38 @@ class DualProcessDispatcher:
                         latency_ms=step_latency,
                         tokens_used=0,  # 0 LLM tokens burned for routing
                         metadata={"simulated": decision.simulated},
-                    )
+                    ),
+                    active_callback,
                 )
+
+                # --- OUTCOME VERIFICATION (JevEvaluator) ---
+                is_verified, v_notes = self.evaluator.verify_step_outcome(
+                    current_subgoal, tool_name, default_args, output_val
+                )
+                self._update_plan_progress(state, tool_name, is_verified, v_notes)
+                if not is_verified:
+                    step_id = active_plan_step.step_id if active_plan_step else 0
+                    verification_failures[step_id] = verification_failures.get(step_id, 0) + 1
+                    correction_guidance = (
+                        f"[VERIFICATION FAILED]: Step '{tool_name}' failed verification: {v_notes}. "
+                        f"Subgoal was: '{current_subgoal}'. Correct your parameters or approach.\n"
+                    )
+                    if verification_failures[step_id] >= 3:
+                        state.is_completed = False
+                        state.final_output = (
+                            f"Could not complete task: subgoal '{current_subgoal}' "
+                            f"failed verification repeatedly: {v_notes}"
+                        )
+                        break
+                else:
+                    correction_guidance = ""
 
                 signature = (tool_name, repr(default_args), str(output_val)[:200])
                 repeat_count = repeat_count + 1 if signature == last_signature else 1
                 last_signature = signature
                 if repeat_count >= 3:
+                    # Stalled runs halted early without accomplishing the goal.
+                    stalled = True
                     state.is_completed = True
                     state.final_output = (
                         f"Stopped after {repeat_count} identical "
@@ -315,27 +558,94 @@ class DualProcessDispatcher:
                     )
                     break
             else:
-                # SLOW PATH: Escalate to System 2 (Hermes, Grok, Claude)
-                # Inject recall context and skill context into the prompt
+                # SLOW PATH: Escalate to System 2 LLM (DeepSeek, Grok, OpenAI, Custom)
+                # Recompute recall context per step so earlier actions and findings in this run
+                # are incorporated into search terms rather than keeping a stale initial query.
+                step_terms = " ".join([s.action for s in state.history] + ([decision.selected_tool] if decision.selected_tool else []))
+                step_query = f"{goal} {step_terms}".strip() if step_terms else goal
+                step_recall_ctx = self.memory.build_recall_context(step_query, limit=3) or recall_ctx
+
                 context_prefix = ""
-                if recall_ctx:
-                    context_prefix += recall_ctx + "\n"
+                if correction_guidance:
+                    context_prefix += correction_guidance + "\n"
+                if step_recall_ctx:
+                    context_prefix += step_recall_ctx + "\n"
                 if skill_ctx:
                     context_prefix += skill_ctx + "\n"
+
+                last_step = state.history[-1] if state.history else None
+                if last_step and any(err_kw in str(last_step.output).lower() for err_kw in ("error", "failed", "denied", "exception", "not found")):
+                    context_prefix += (
+                        f"[AUTO-CORRECTION GUIDANCE]: The previous action '{last_step.action}' resulted in: "
+                        f"{str(last_step.output)[:300]}. Analyze this feedback, adjust your parameters or strategy, and proceed.\n"
+                    )
 
                 s2_prompt = context_prefix + state.to_system_two_prompt(
                     self.mcp.get_formatted_tool_list_for_system_two()
                 )
-                s2_response = self.s2.generate_step(s2_prompt)
+                s2_images = (
+                    [step_grid_path or step_screenshot_path]
+                    if (step_grid_path or step_screenshot_path)
+                    else None
+                )
+                if s2_images:
+                    try:
+                        s2_response = self.s2.generate_step(s2_prompt, images=s2_images)
+                    except TypeError:
+                        s2_response = self.s2.generate_step(s2_prompt)
+                else:
+                    s2_response = self.s2.generate_step(s2_prompt)
                 s2_latency_total += s2_response.latency_ms
                 if s2_response.is_mock:
                     s2_is_mock = True
                     s2_degraded_reason = s2_response.degraded_reason
+                    # If this was not intentionally the mock provider, fail loudly rather than faking completion
+                    if s2_degraded_reason and "mock provider — no real model" not in s2_degraded_reason:
+                        state.is_completed = False
+                        state.final_output = f"System 2 failure: {s2_degraded_reason}"
+                        self._record_step(
+                            state,
+                            StepRecord(
+                                step_index=step_idx,
+                                step_type=StepType.SYSTEM_TWO_GENERATION,
+                                action="system_two_failure",
+                                action_input={"reason": s2_degraded_reason},
+                                output=state.final_output,
+                                latency_ms=s2_response.latency_ms,
+                                tokens_used=0,
+                            ),
+                            active_callback,
+                        )
+                        break
+
+                if s2_response.action == "system_two_incomplete":
+                    self._record_step(
+                        state,
+                        StepRecord(
+                            step_index=step_idx,
+                            step_type=StepType.SYSTEM_TWO_GENERATION,
+                            action="system_two_incomplete",
+                            action_input=s2_response.args,
+                            output=(
+                                "Model provided thought but did not specify an 'action' or 'args'. "
+                                "You must invoke a concrete MCP tool (e.g. patch_file, write_file, search_file) to make progress."
+                            ),
+                            latency_ms=s2_response.latency_ms,
+                            tokens_used=s2_response.tokens_used,
+                        ),
+                        active_callback,
+                    )
+                    continue
 
                 if s2_response.action == "finish_task":
                     state.is_completed = True
                     state.final_output = s2_response.generated_content or s2_response.thought
-                    state.history.append(
+                    for p in state.plan:
+                        if not p.completed:
+                            p.completed = True
+                            p.verified = True
+                    self._record_step(
+                        state,
                         StepRecord(
                             step_index=step_idx,
                             step_type=StepType.SYSTEM_TWO_GENERATION,
@@ -344,14 +654,37 @@ class DualProcessDispatcher:
                             output=state.final_output,
                             latency_ms=s2_response.latency_ms,
                             tokens_used=s2_response.tokens_used,
-                        )
+                        ),
+                        active_callback,
                     )
                     break
                 else:
-                    # --- PERMISSION BROKER: gate S2 tool calls too ---
                     s2_action = s2_response.action
                     s2_args = s2_response.args
                     tool_def = self.mcp.get_tool(s2_action)
+
+                    # --- SCHEMA VALIDATION: validate System 2 arguments too ---
+                    # Wrong-typed or unknown arguments from System 2 must be rejected
+                    # rather than executed, allowing the auto-correction guidance loop to kick in.
+                    s2_arg_ok, s2_arg_err = validate_tool_args(tool_def, s2_args)
+                    if not s2_arg_ok:
+                        val_err_msg = f"Argument validation failed for '{s2_action}': {s2_arg_err}"
+                        logger.warning(f"[Dispatcher] {val_err_msg}")
+                        self._record_step(
+                            state,
+                            StepRecord(
+                                step_index=step_idx,
+                                step_type=StepType.SYSTEM_TWO_GENERATION,
+                                action=s2_action,
+                                action_input=s2_args,
+                                output=val_err_msg,
+                                latency_ms=s2_response.latency_ms,
+                                tokens_used=s2_response.tokens_used,
+                            ),
+                            active_callback,
+                        )
+                        continue
+
                     if tool_def and tool_def.requires_approval:
                         approval, s2_args = self.broker.request_approval(
                             tool_name=s2_action,
@@ -359,7 +692,8 @@ class DualProcessDispatcher:
                             risk_level=tool_def.risk_level,
                         )
                         if approval == ApprovalDecision.DENY:
-                            state.history.append(
+                            self._record_step(
+                                state,
                                 StepRecord(
                                     step_index=step_idx,
                                     step_type=StepType.SYSTEM_TWO_GENERATION,
@@ -368,14 +702,16 @@ class DualProcessDispatcher:
                                     output="[DENIED by user]",
                                     latency_ms=s2_response.latency_ms,
                                     tokens_used=s2_response.tokens_used,
-                                )
+                                    ),
+                                active_callback,
                             )
                             continue
 
                     exec_result = self.mcp.execute_tool(s2_action, s2_args)
                     output_val = exec_result.output if exec_result.success else exec_result.error
                     total_step_lat = s2_response.latency_ms + exec_result.execution_time_ms
-                    state.history.append(
+                    self._record_step(
+                        state,
                         StepRecord(
                             step_index=step_idx,
                             step_type=StepType.SYSTEM_TWO_GENERATION,
@@ -384,8 +720,95 @@ class DualProcessDispatcher:
                             output=output_val,
                             latency_ms=total_step_lat,
                             tokens_used=s2_response.tokens_used,
-                        )
+                        ),
+                        active_callback,
                     )
+
+                    # --- OUTCOME VERIFICATION (JevEvaluator) ---
+                    is_verified, v_notes = self.evaluator.verify_step_outcome(
+                        current_subgoal, s2_action, s2_args, output_val
+                    )
+
+                    # Physical visual verification via screen_diff
+                    if (
+                        is_verified
+                        and s2_action in ("mouse_click", "key_press", "mouse_move")
+                        and step_screenshot_path
+                        and self.mcp.get_tool("screen_diff")
+                    ):
+                        try:
+                            time.sleep(0.05)
+                            post_ss = self.mcp.execute_tool("screenshot", {})
+                            if post_ss.success and post_ss.output:
+                                import json as _json
+                                post_meta = _json.loads(post_ss.output)
+                                post_path = post_meta.get("path")
+                                if post_path:
+                                    diff_res = self.mcp.execute_tool(
+                                        "screen_diff",
+                                        {
+                                            "image_path_1": step_screenshot_path,
+                                            "image_path_2": post_path,
+                                        },
+                                    )
+                                    if diff_res.success and diff_res.output:
+                                        diff_data = _json.loads(diff_res.output)
+                                        if not diff_data.get("changed", True):
+                                            is_verified = False
+                                            v_notes = (
+                                                f"Visual verification failed: screen diff detected no change "
+                                                f"({diff_data.get('diff_percentage', '0.00%')}) after '{s2_action}'. "
+                                                "The action did not alter the screen."
+                                            )
+                        except Exception as diff_err:
+                            logger.debug(f"[Dispatcher] Visual screen_diff error: {diff_err}")
+
+                    self._update_plan_progress(state, s2_action, is_verified, v_notes)
+                    if not is_verified:
+                        step_id = active_plan_step.step_id if active_plan_step else 0
+                        verification_failures[step_id] = verification_failures.get(step_id, 0) + 1
+                        correction_guidance = (
+                            f"[VERIFICATION FAILED]: Step '{s2_action}' failed verification: {v_notes}. "
+                            f"Subgoal was: '{current_subgoal}'. Correct your parameters or approach.\n"
+                        )
+                        if verification_failures[step_id] >= 3:
+                            state.is_completed = False
+                            state.final_output = (
+                                f"Could not complete task: subgoal '{current_subgoal}' "
+                                f"failed verification repeatedly: {v_notes}"
+                            )
+                            break
+                    else:
+                        correction_guidance = ""
+
+                    if s2_action in ("mouse_click", "key_press"):
+                        screen_sig = (s2_action, repr(s2_args), is_verified)
+                        if screen_sig == last_signature and not is_verified:
+                            repeat_count += 1
+                        else:
+                            repeat_count = 1
+                        last_signature = screen_sig
+                        if repeat_count >= 3:
+                            stalled = True
+                            state.is_completed = True
+                            state.final_output = (
+                                f"Stopped after {repeat_count} consecutive failed '{s2_action}' steps "
+                                "with no visual screen change — the goal is not progressing."
+                            )
+                            logger.warning(
+                                f"[Dispatcher] Stalled on repeated '{s2_action}' without screen change; ending run early."
+                            )
+                            break
+
+        if not state.is_completed and not state.final_output:
+            incomplete = [p.description for p in state.plan if not p.completed]
+            if incomplete:
+                state.final_output = (
+                    f"Could not complete task within {max_steps} steps. "
+                    f"Unfinished subgoals: {', '.join(incomplete)}"
+                )
+            else:
+                state.final_output = f"Could not complete task within step budget ({max_steps} steps)."
 
         # Attribute any router time not yet billed to a step record.
         #
@@ -403,7 +826,8 @@ class DualProcessDispatcher:
                     last.latency_ms + self._pending_verification_latency_ms, 3
                 )
             else:
-                state.history.append(
+                self._record_step(
+                    state,
                     StepRecord(
                         step_index=1,
                         step_type=StepType.SYSTEM_ONE_EVALUATION,
@@ -411,7 +835,8 @@ class DualProcessDispatcher:
                         output=None,
                         latency_ms=round(self._pending_verification_latency_ms, 3),
                         tokens_used=0,
-                    )
+                    ),
+                    active_callback,
                 )
             self._pending_verification_latency_ms = 0.0
 
@@ -467,8 +892,12 @@ class DualProcessDispatcher:
                 steps=[s.model_dump() for s in state.history],
             )
 
-            # Auto-learn skill if completed with at least 1 tool step
-            if state.is_completed:
+            # Auto-learn skill only if run completed cleanly without stalling
+            # and auto_learn_skills is enabled in configuration.
+            # Stalled runs and runs that exhausted max steps did not achieve the
+            # goal, so synthesizing a skill would preserve a non-working sequence.
+            should_learn = getattr(self.config, "auto_learn_skills", True)
+            if state.is_completed and not stalled and should_learn:
                 tool_seq = [s.action for s in state.history if s.action != "finish_task"]
                 if tool_seq:
                     keywords = [w.lower() for w in goal.split() if len(w) > 3][:5]
@@ -487,6 +916,16 @@ class DualProcessDispatcher:
                         )
                     except Exception as se:
                         logger.warning(f"[Dispatcher] Could not synthesize skill file: {se}")
+
+            # Persist durable facts to USER.md (cross-session user profile)
+            if state.is_completed and not stalled:
+                try:
+                    tool_seq = [s.action for s in state.history if s.action != "finish_task"]
+                    tool_desc = f" using {', '.join(sorted(set(tool_seq)))}" if tool_seq else ""
+                    fact = f"Completed goal: '{goal}'{tool_desc}."
+                    self.memory.update_user_profile(fact)
+                except Exception as ue:
+                    logger.debug(f"[Dispatcher] Could not update USER.md: {ue}")
         except Exception as e:
             logger.warning(f"Error persisting session to memory: {e}")
 
@@ -509,6 +948,7 @@ class DualProcessDispatcher:
             simulated_latency_ms=round(simulated_s1_latency, 3),
             system_two_is_mock=s2_is_mock,
             system_two_degraded_reason=s2_degraded_reason,
+            plan=state.plan,
         )
 
     def _check_fast_path_confidence(

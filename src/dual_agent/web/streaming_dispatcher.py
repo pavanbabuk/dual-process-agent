@@ -25,6 +25,7 @@ import uuid
 from typing import Dict, Any, Optional
 
 from dual_agent.dispatcher import DualProcessDispatcher
+from dual_agent.state import StepRecord, StepType
 from dual_agent.permission_broker import PermissionBroker, ApprovalDecision
 
 logger = logging.getLogger(__name__)
@@ -172,42 +173,29 @@ class StreamingDispatcher:
             self.dispatcher.broker = original_broker
 
     def _run_with_hooks(self, goal: str, max_steps: int, loop: asyncio.AbstractEventLoop):
-        """Run dispatcher and emit step events by temporarily patching mcp.execute_tool."""
-        import time
+        """Run dispatcher and emit step events tagged with their real execution path."""
+        def on_step(record: StepRecord):
+            path_str = "S1_FAST"
+            if record.step_type == StepType.SYSTEM_TWO_GENERATION:
+                path_str = "S2_SLOW"
+            elif record.step_type == StepType.TERMINATION:
+                path_str = "TERMINAL"
+            elif record.step_type == StepType.SYSTEM_ONE_EVALUATION:
+                path_str = "S1_FAST"
 
-        path_map = {
-            "S1_FAST":  "S1_FAST",
-            "S2_SLOW":  "S2_SLOW",
-            "TERMINAL": "TERMINAL",
-        }
-
-        # Wrap mcp.execute_tool to emit a step event after each real tool call
-        original_execute = self.dispatcher.mcp.execute_tool
-        step_counter = [0]
-
-        def patched_execute(name: str, arguments: dict):
-            t0 = time.perf_counter()
-            result = original_execute(name, arguments)
-            latency_ms = round((time.perf_counter() - t0) * 1000, 1)
-            step_counter[0] += 1
             asyncio.run_coroutine_threadsafe(
                 self._send_event({
                     "type": "step",
-                    "step": step_counter[0],
-                    "path": "S1_FAST",
-                    "action": name,
-                    "args": arguments,
-                    "output": str(result.output if hasattr(result, "output") else result)[:400],
-                    "latency_ms": latency_ms,
-                    "tokens_used": 0,
+                    "step": record.step_index,
+                    "path": path_str,
+                    "action": record.action,
+                    "args": record.action_input or {},
+                    "output": str(record.output if record.output is not None else "")[:400],
+                    "latency_ms": round(record.latency_ms, 1),
+                    "tokens_used": record.tokens_used,
                 }),
                 loop,
             )
-            return result
 
-        self.dispatcher.mcp.execute_tool = patched_execute
-        try:
-            return self.dispatcher.run(goal=goal, max_steps=max_steps)
-        finally:
-            self.dispatcher.mcp.execute_tool = original_execute
+        return self.dispatcher.run(goal=goal, max_steps=max_steps, step_callback=on_step)
 

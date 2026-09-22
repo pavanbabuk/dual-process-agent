@@ -38,10 +38,11 @@ Every module under `src/dual_agent/`.
 | `permission_broker.py` | `PermissionBroker`. Renders the `Allow once / Allow session / Deny / Edit args` card, holds session-level allow/deny sets, denies when no terminal exists, and writes every decision to the `approval_audit` table. |
 | `memory.py` | `MemoryEngine`. SQLite persistence: sessions, sessions_fts (FTS5), learned_skills, project_context, approval_audit, scheduled_jobs. Also owns USER.md read/append and `build_recall_context`. |
 | `skills_manager.py` | `SkillsManager`. Synthesizes `.SKILL.md` files (YAML frontmatter + Markdown) after a successful run, parses them back, scores them by keyword overlap, and builds the skill context block. |
+| `screen.py` | Perception, Set-of-Mark grid annotation, non-model pixel outcome verification (`screen_diff`), and desktop actuation primitives (`mouse_click`, `mouse_move`, `key_press`) with bounds validation, kill switch (`DUAL_AGENT_SCREEN_CONTROL`), and dynamic Retina scale calibration. |
 | `scheduler.py` | `CronScheduler` plus `parse_nl_to_cron`. Natural-language → cron parsing, SQLite-backed job CRUD, a 60-second asyncio tick loop, and a hand-rolled due-date matcher. |
 | `team_manifest.py` | `TeamManifestManager`. Exports the config/providers/MCP servers/skills as a portable Markdown manifest with YAML frontmatter; imports one from a path or an HTTP(S) URL. |
 | `config.py` | `AgentConfig` pydantic model, `.env` file loading with real-env precedence, `load_config`, `save_config` (0600), and the interactive setup wizard. |
-| `evaluator.py` | `JevEvaluator`. Thin wrapper exposing `check_task_completion` and `score_output`. **Not wired into the dispatcher** — see limitations. |
+| `evaluator.py` | `JevEvaluator`. Fast-path outcome verification, step guardrails, and quality scoring. Actively wired into `dispatcher.py` (`verify_step_outcome` for post-execution checks, `check_task_completion` for completion validation, and `score_output`). |
 | `updater.py` | `perform_update`. `git pull origin master` (falling back to `main`) if running from a clone, then reports the installed `typesafe_sdk` version. |
 | `shell.py` | `InteractiveShell`. The Rich TUI REPL, slash-command dispatch (`/tools`, `/recall`, `/schedule`, `/export`, …), and the terminal entry into the dispatcher. |
 | `cli.py` | Argument parsing and `run_agent_task`. Pre-dispatch routing for `config`, `update`, `--ui`, `--gateway`, and the measured-only telemetry table. |
@@ -109,10 +110,18 @@ The re-check goes through `_check_fast_path_confidence`, which calls
 `_compute_fast_path_confidence` moves that delta into `_pending_verification_latency_ms`, which the
 main loop adds to `s1_latency_total` so verification is attributed rather than hidden.
 
-**Fast path is taken only if all three hold:**
+**Fast path is taken only if all conditions hold (Two-Condition Distribution Gate & Per-Action Risk Threshold):**
 
-```
-fast_path_confidence >= self.confidence_threshold   # default 0.85, env SYSTEM_ONE_CONFIDENCE_THRESHOLD
+```python
+# 1. Router distribution concentration and option probability gates (rejects flat / uncertain distributions)
+distribution_confidence >= THRESHOLD_DISTRIBUTION_CONCENTRATION  # default 0.65
+and option_probability >= THRESHOLD_OPTION_PROBABILITY            # default 0.50
+
+# 2. Risk-calibrated threshold per action
+and fast_path_confidence >= self._get_tool_confidence_threshold(tool_name)
+# (low risk read-only: ~0.75; medium risk file modification: ~0.88; high risk destructive: ~0.92)
+
+# 3. Decision flags and tool validity
 and not decision.needs_generation
 and decision.selected_tool in tool_descriptions
 ```
@@ -140,18 +149,55 @@ System 2 so a model can read the goal and supply real arguments.
 This exists because the router only chose a *name*. Sending plausible-but-wrong args (reading
 `pyproject.toml` for an unrelated goal) looks like success and is worse than failing.
 
-### 3.4 Permission gate and execution
+### 3.4 Classification separate from authorization
 
-If `tool_def.requires_approval`, `self.broker.request_approval(tool_name, default_args,
-risk_level)` runs. A `DENY` appends a step record with output `[DENIED by user]` and `continue`s —
-note it consumes a step index. An `EDITED`/`ALLOW` returns possibly-rewritten args that are then
-used. `write_file` (medium risk) and `run_shell_command` (high risk) both carry
-`requires_approval=True`.
+In accordance with vendor guidance, Jev is used strictly for intent classification and reflex routing,
+never for authorizing destructive actions.
 
-Then `self.mcp.execute_tool(tool_name, default_args)` and one `StepRecord` is appended with
-`step_type=SYSTEM_ONE_FAST_TOOL`, `tokens_used=0`, and `metadata={"simulated": decision.simulated}`.
+Authorization is governed strictly by the `PermissionBroker`:
+If `tool_def.requires_approval`, `self.broker.request_approval(tool_name, default_args, risk_level)`
+runs. A `DENY` appends a step record with output `[DENIED by user]` and `continue`s — note it consumes
+a step index. An `EDITED`/`ALLOW` returns possibly-rewritten args that are then used. `write_file`
+(medium risk) and `run_shell_command` (high risk) both carry `requires_approval=True`.
 
-### 3.5 Stall detection
+### 3.5 The Plan → Act → Verify → Correct Loop
+
+Before execution begins, `_create_plan(goal, ...)` generates an ordered sequence of concrete
+`PlanStep` subgoals attached to `state.plan`.
+
+1. **Plan**: System 2 or heuristic goal decomposition generates 2 to 4 structured subgoals.
+2. **Act**: The active step is executed either via System 1 reflex or System 2 deliberate generation.
+3. **Verify**: Following execution, `JevEvaluator.verify_step_outcome(subgoal, action, args, output)` validates:
+   - Output validity (null/empty outputs rejected, except valid empty stdout on successful shell commands).
+   - Tool error and denial detection.
+   - Filesystem effects: target file presence for `write_file`/`patch_file`/`read_file`.
+   - AST validation: `validate_python_syntax` runs on all modified `.py` files to catch syntax regressions immediately.
+4. **Correct**: If verification fails:
+   - Feedback notes and verification error guidance are injected into the prompt for the next step.
+   - Bounded retries: up to 3 attempts per subgoal. If a subgoal fails 3 times, the agent stops immediately and reports an honest failure (`is_completed=False`) rather than hallucinating success.
+
+### 3.6 Screen Perception, Desktop Actuation, and Visual Verification
+
+When the goal involves visual desktop interaction (or when `enable_screen_loop=True` / `DUAL_AGENT_SCREEN_LOOP=1`), the agent interacts directly with the live graphical environment:
+
+1. **Perception**: At the start of each step, `screenshot` captures the active display and `grid_overlay` renders a calibrated coordinate grid overlay (`step_grid_path`), which is passed to multimodal System 2 models via `generate_step(prompt, images=[step_grid_path])`.
+2. **Dynamic Calibration**: Coordinate scaling is computed dynamically at runtime (`pixel_resolution / logical_bounds`) via macOS Quartz APIs, supporting varied Retina scale factors (~1.336 or 2.0) without hardcoded offsets.
+3. **Desktop Actuation Primitives**:
+   - `mouse_click(x, y, button, click_type)`: Actuates clicks at logical coordinates via Quartz.
+   - `mouse_move(x, y)`: Moves mouse cursor on active screen.
+   - `key_press(key, modifiers)`: Sends keystrokes against a strict allow-list of named keys (`return`, `tab`, `escape`, arrow keys) and Unicode characters.
+4. **Safety & Permission Gating**:
+   - **Single checkpoint**: Actuation tools carry `requires_approval=True` and `risk_level="high"`. They pass through identical schema validation and the `PermissionBroker` on both fast and slow paths.
+   - **Hardware kill switch**: `DUAL_AGENT_SCREEN_CONTROL=0` immediately halts and rejects any actuation attempt.
+   - **Display bounds enforcement**: Clicks or moves outside logical screen bounds are rejected before posting events.
+   - **OS Accessibility permissions**: Detects if macOS accessibility (`AXIsProcessTrusted`) is absent and raises actionable instructions.
+5. **Physical Outcome Verification (`screen_diff`)**:
+   - Following every actuation action (`mouse_click`, `key_press`), `screen_diff` computes the pixel difference against the pre-action screenshot without calling a model.
+   - **No model self-reporting**: The model's claim that a button was clicked is treated as a hypothesis. Only `screen_diff` decides whether the screen changed.
+   - If `screen_diff` reports no change (`changed=False`), the step fails verification (`is_verified=False`), injecting auto-correction guidance for coordinate or timing retry.
+   - Three consecutive identical actuation attempts with no visual screen change trigger the stall guard and terminate the run.
+
+### 3.7 Stall detection
 
 After a fast-path step, `signature = (tool_name, repr(default_args), str(output_val)[:200])`. If
 the signature equals `last_signature`, `repeat_count += 1`, else it resets to 1. At
@@ -161,23 +207,20 @@ progressing.
 This matters economically: in live mode every one of those steps would be a paid Jev call, so the
 runtime stops rather than paying to produce nothing.
 
-### 3.6 The slow path (System 2)
+### 3.7 The slow path (System 2)
 
 Entered when the gate fails, when `needs_generation` is set, when the chosen tool is not registered,
 or when argument validation refused the fast path.
 
-1. `context_prefix` = recall context + skill context, each followed by a newline.
+1. `context_prefix` = recall context + skill context + verification failure correction guidance.
 2. `s2_prompt = context_prefix + state.to_system_two_prompt(self.mcp.get_formatted_tool_list_for_system_two())`.
 3. `self.s2.generate_step(s2_prompt)`.
-4. If `action == "finish_task"`, complete and record `SYSTEM_TWO_GENERATION` carrying
-   `s2_response.tokens_used`.
-5. Otherwise, **the same permission broker gates the System 2 call** (identical
-   `requires_approval` / deny / record path), then `self.mcp.execute_tool(s2_action, s2_args)`.
+4. If `action == "finish_task"`, complete and record `SYSTEM_TWO_GENERATION` carrying `s2_response.tokens_used`.
+5. **Schema Validation**: Both System 1 and System 2 arguments are strictly validated against `validate_tool_args`.
+6. **Permission Gate**: The same permission broker gates the System 2 call (identical `requires_approval` / deny / record path), then `self.mcp.execute_tool(s2_action, s2_args)`.
+7. **Outcome Verification**: `verify_step_outcome` runs on System 2 outcomes and updates plan progress.
 
-Note: System 2's `args` are **not** run through `validate_tool_args`. Only the fast path is
-schema-validated.
-
-### 3.7 Accounting and reconciliation
+### 3.8 Accounting and reconciliation
 
 Two corrections run after the loop so the reported numbers cannot drift optimistic:
 
@@ -555,14 +598,9 @@ Plain statements of what does not work or is weak today, read off the code.
 **Generation**
 
 - **System 2 defaults to `mock`.** `get_system_two_provider` returns `MockSystemTwoProvider` unless
-  `SYSTEM_TWO_PROVIDER` says otherwise. `MockSystemTwoProvider.generate_step` sleeps 300ms and
-  returns one of two canned branches: a hardcoded summary string, or a `write_file` call writing
-  `generated_script.py` containing `print('System 2 output')`. It reports `tokens_used=450` — a
-  constant — for either branch. **Out of the box the agent cannot actually generate anything.**
-- `HermesProvider` and `OpenAICompatibleProvider` both **silently fall back to the mock** on any
-  exception, including a missing API key. A provider outage is indistinguishable from a mock run in
-  the step record, which carries the mock's `tokens_used=450` as if it were real.
-- `anthropic` is a selectable provider that is not implemented.
+  `SYSTEM_TWO_PROVIDER` or `config.json` specifies a real provider (`deepseek`, `grok`, `openai`, `custom`).
+- Real S2 providers fail loudly if misconfigured or unreachable rather than quietly faking success.
+- `anthropic` is not implemented; requests for it raise a clear `ValueError`.
 
 **Routing**
 
@@ -583,71 +621,50 @@ Plain statements of what does not work or is weak today, read off the code.
 
 **Tools**
 
-- **No MCP client exists.** `MCPManager.attach_to_host` registers a placeholder whose handler
-  returns `f"Dispatched to external MCP server '{n}': {args}"`. No subprocess, no handshake, no tool
-  discovery. The `mcp` dependency is never imported. Only the 4 built-in tools do real work.
+- **External MCP client connection:** `MCPManager` fails loudly if an external MCP server is called,
+  stating that external JSON-RPC connections are not yet supported, rather than returning fake success strings.
 - `run_shell_command` cannot use pipes, redirects, globs, or `$VAR`, because it is argv-only by
   design. There is no allow-list or blocklist on the binary either — anything on `PATH` is
   reachable if the user approves the card.
-- `validate_tool_args` covers only `string`, `integer`, and `boolean`, and does not reject unknown
-  keys. System 2's tool arguments are not validated at all — only the fast path is.
-- `read_file` truncates at 10,000 characters with no indication that truncation happened.
+- `validate_tool_args` rejects unknown keys and validates schema types on both fast and slow paths.
+- `read_file` appends an explicit truncation marker `...[truncated N characters of M]` if the file
+  exceeds 10,000 characters so downstream steps know the content is incomplete.
 
 **Loop and termination**
 
 - `max_steps` (default 15 in `run`, 10 from the CLI and gateway) is the only hard stop. There is no
   goal-decomposition step, so a goal needing more than `max_steps` sequential steps simply ends
   incomplete.
-- Stall detection compares `(tool, args, first 200 chars of output)`. A loop that alternates between
-  two tools, or whose output varies slightly each step, is not caught.
+- Stall detection halts runs after 3 identical steps without progress. Stalled runs are excluded
+  from skill synthesis and user profile recording.
 
 **Memory and learning**
 
 - **`token_savings_pct` is written as `NULL`**, and `get_aggregate_stats` returns `None` for the
   average, because no baseline run is performed. The shell renders `n/a (no baseline run)`. This is
-  deliberate — the predecessor code multiplied step count by hardcoded constants (1500 tokens /
-  1200 ms) to produce "savings" and a CLI column labelled `Traditional LLM Baseline`. There is no
-  timing, token-saving, or speedup claim anywhere in this runtime, and none should be inferred.
-- **`USER.md` is never written by the agent.** `update_user_profile` exists and is tested, but
-  nothing in `dispatcher.py`, `shell.py`, or `gateway/` calls it. `/whoami` will report "No USER.md
-  profile yet" on a fresh install no matter how much you use it.
-- `find_matching_skill`'s subset test breaks on any extra goal word: keywords `["inspect",
-  "pyproject"]` matches "inspect pyproject" but not "please inspect the pyproject files". The result
-  is **logged only** — it does not currently change routing or skip steps, so the "learned skill
-  replay" path is inert.
-- Skill retrieval scores `overlap * success_count`, where `success_count` increments on every
-  re-synthesis. A frequently-repeated skill can outrank a better keyword match.
-- `build_recall_context` is computed once before the loop, so context never updates mid-run.
-- `skills.synthesize_skill` fires on *any* completed run with ≥1 tool step, including runs that
-  completed because stall detection gave up. Failed or blocked runs can therefore produce a
-  `.SKILL.md` describing a procedure that did not work.
-- `save_project_context` / `get_project_context` exist (and are created in the schema) but nothing
-  calls them. `AgentConfig.auto_learn_skills` and `auto_scan_workspace` are never read.
+  deliberate — there is no benchmark harness in this repo.
+- `USER.md` is updated on completed runs with durable facts about the goal and tools used,
+  accumulating across sessions and viewable via `/whoami`.
+- `build_recall_context` is recomputed per step to incorporate actions and findings from earlier steps.
+- `AgentConfig.auto_learn_skills` controls skill synthesis; `auto_scan_workspace` inspects project files
+  and records context in memory.
 
 **Scheduler**
 
-- `_is_due` supports only `*`, `*/N`, and exact matches — no lists, ranges, or month/weekday names.
-- Jobs only fire while `dual-agent --gateway` is running. `--ui` builds a `CronScheduler` but never
-  ticks it, so `/api/schedules` can list jobs that never run.
-- `_run_job` renders its output with a `rich` `Console` to stdout, which in a daemon is usually
-  discarded. Scheduled results are not sent over the gateway to any chat.
-- `_tick` catches and logs per-job exceptions inside `_run_job`, but `_tick` itself iterating a job
-  whose row is malformed raises into `run_forever`'s handler for the whole tick.
+- `_is_due` supports wildcards, steps (`*/N`), exact values, comma-separated lists, ranges, range steps,
+  month names (`jan`-`dec`), and weekday names (`mon`-`sun`).
+- `dual-agent ui` runs a background tick loop every 20s. Scheduled jobs execute in the background;
+  results are logged to console and stored in memory.
 
 **Gateway and dashboard**
 
 - Telegram only. `GatewayAdapter` is an ABC with one implementation; `filters.TEXT & ~COMMAND` means
   commands, photos, documents, and voice are ignored.
 - Gateway runs default to `max_steps=10`.
-- `handle_message` runs a blocking `dispatcher.run` per message in the default executor. Two
-  concurrent messages in the same chat share one dispatcher, whose `_current_goal` and state are
-  single-valued — there is no per-chat run lock.
-- `SessionRouter._sessions` grows without bound; `destroy` is never called by the runner.
 - The dashboard has **no authentication** and can execute tools as the user. Loopback-only by
   default, gated by an explicit opt-out for non-loopback binds.
-- The dashboard hardcodes `force_simulation=True` for System 1, so UI runs never exercise live Jev.
-- WebSocket `step` events are emitted by a monkey-patched `execute_tool` and always tag
-  `path: "S1_FAST"`; the slow path is indistinguishable in the event stream.
+- WebSocket `step` events are emitted via `step_callback` with the real path taken (`S1_FAST`, `S2_SLOW`, `TERMINAL`),
+  including actual latency and token counts.
 - Streaming is step-level, not token-level. There is no partial-output streaming anywhere: System 2
   responses are requests with `stream` unset, and `httpx.Client.post` reads the whole body.
 - WebSocket responses are not correlated to the request that started them; two overlapping `run`

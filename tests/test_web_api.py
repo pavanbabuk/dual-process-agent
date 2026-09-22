@@ -111,6 +111,34 @@ def test_api_profile_empty(client):
     assert "profile" in r.json()
 
 
+def test_api_config_get_and_post(client):
+    # GET config
+    r = client.get("/api/config")
+    assert r.status_code == 200
+    cfg_data = r.json()
+    assert "system_two_provider" in cfg_data
+    assert "system_one_confidence_threshold" in cfg_data
+
+    # POST config updates
+    r2 = client.post("/api/config", json={
+        "system_two_provider": "mock",
+        "system_one_confidence_threshold": 0.90,
+        "grok_api_key": "xai-test-key-12345",
+    })
+    assert r2.status_code == 200
+    res = r2.json()
+    assert res["ok"] is True
+    assert res["provider"] == "MOCK"
+    assert res["confidence_threshold"] == 0.90
+
+    # Verify GET returns updated values
+    r3 = client.get("/api/config")
+    cfg_updated = r3.json()
+    assert cfg_updated["system_two_provider"] == "mock"
+    assert cfg_updated["system_one_confidence_threshold"] == 0.90
+    assert cfg_updated["grok_api_key"] == "xai-test-key-12345"
+
+
 def test_websocket_ping_pong(client):
     with client.websocket_connect("/ws") as ws:
         init = ws.receive_json()  # consume init event
@@ -156,3 +184,71 @@ def test_websocket_empty_goal_returns_error(client):
         ws.send_json({"type": "run", "goal": ""})
         msg = ws.receive_json()
         assert msg["type"] == "error"
+
+
+def test_api_screen_preview(client):
+    r = client.get("/api/screen/preview")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert "data_url" in data
+    assert data["data_url"].startswith("data:image/png;base64,")
+    assert data["logical_width"] > 0
+    assert data["logical_height"] > 0
+    assert data["scale_x"] >= 1.0
+
+
+def test_api_screen_preview_with_grid(client):
+    r = client.get("/api/screen/preview?grid=true")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert "data_url" in data
+    assert data["data_url"].startswith("data:image/png;base64,")
+
+
+def test_api_screen_click_bounds(client):
+    r = client.post("/api/screen/click", json={"x": 99999, "y": 99999})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is False
+    assert "out of bounds" in data["error"]
+
+
+def test_api_screen_type(client):
+    # Empty payload returns error
+    r = client.post("/api/screen/type", json={})
+    assert r.status_code == 200
+    assert r.json()["ok"] is False
+
+    # Invalid key returns error
+    r_inv = client.post("/api/screen/type", json={"key": "nonexistent_special_key"})
+    assert r_inv.status_code == 200
+    assert r_inv.json()["ok"] is False
+    assert "Unrecognized key" in r_inv.json()["error"]
+
+    # Valid key with mocked actuation
+    from unittest.mock import patch
+    with patch("dual_agent.screen.send_key_press", return_value={"key": "return"}):
+        r2 = client.post("/api/screen/type", json={"key": "return"})
+        assert r2.status_code == 200
+        assert r2.json()["ok"] is True
+
+
+def test_api_config_vision_fields(client):
+    r = client.post("/api/config", json={
+        "vision_provider": "openai",
+        "vision_model": "gpt-4o",
+        "vision_base_url": "https://api.openai.com/v1",
+    })
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+    r2 = client.get("/api/config")
+    assert r2.status_code == 200
+    cfg = r2.json()
+    assert cfg["vision_provider"] == "openai"
+    assert cfg["vision_model"] == "gpt-4o"
+    assert cfg["vision_base_url"] == "https://api.openai.com/v1"
+    assert "screen_control_enabled" in cfg
+

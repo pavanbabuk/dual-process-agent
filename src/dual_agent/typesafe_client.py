@@ -19,13 +19,47 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# Named per-factor thresholds for Jev routing decisions (vendor spec alignment).
+#
+# Trade-offs:
+# THRESHOLD_NEEDS_WRITING: Lowering sends more tasks to System 2 to write prose,
+# preventing tool hallucinatory answers; raising risks tools guessing English prose.
+THRESHOLD_NEEDS_WRITING = float(os.getenv("JEV_THRESHOLD_NEEDS_WRITING", "0.65"))
+
+# THRESHOLD_NEEDS_CODE: Lowering escalates coding tasks to System 2 earlier,
+# ensuring full LLM generation; raising risks fast-path attempting code generation without LLM.
+THRESHOLD_NEEDS_CODE = float(os.getenv("JEV_THRESHOLD_NEEDS_CODE", "0.65"))
+
+# THRESHOLD_NEEDS_EXPLANATION: Lowering escalates when verbal explanation is desired;
+# raising keeps fast-path executing tools without narrative.
+THRESHOLD_NEEDS_EXPLANATION = float(os.getenv("JEV_THRESHOLD_NEEDS_EXPLANATION", "0.70"))
+
+# THRESHOLD_GOAL_SATISFIED: Threshold on evidence in state that primary goal is met;
+# higher bar prevents premature termination before files are written or verified.
+THRESHOLD_GOAL_SATISFIED = float(os.getenv("JEV_THRESHOLD_GOAL_SATISFIED", "0.85"))
+
+# Minimum concentration threshold (floor on distribution concentration)
+# Flat distributions (e.g. all 0.25) have low concentration and must not clear the gate.
+THRESHOLD_DISTRIBUTION_CONCENTRATION = float(os.getenv("JEV_THRESHOLD_DISTRIBUTION_CONCENTRATION", "0.60"))
+
+# Minimum option probability (floor on selected choice probability)
+THRESHOLD_OPTION_PROBABILITY = float(os.getenv("JEV_THRESHOLD_OPTION_PROBABILITY", "0.60"))
+
+
 class JevDecision(BaseModel):
     """Decision output from Jev System 1 model."""
     selected_tool: str
     confidence: float
+    option_probability: Optional[float] = None
+    distribution_confidence: Optional[float] = None
     probabilities: Dict[str, float] = Field(default_factory=dict)
     is_terminal: bool = False
     needs_generation: bool = False
+    needs_writing: bool = False
+    needs_code: bool = False
+    needs_explanation: bool = False
+    goal_satisfied: bool = False
+    evidence_sufficient: bool = True
     evaluation_score: Optional[int] = None
     latency_ms: float = 0.0
     simulated: bool = False
@@ -122,11 +156,24 @@ class JevSystemOneClient:
                     instructions="Select the single most appropriate tool or action to progress the goal given current state.",
                     criteria=criteria,
                 ),
-                "is_finished": Noul(
-                    instructions="Has the agent completely fulfilled the user's primary goal?",
+                "goal_satisfied": Noul(
+                    instructions="Based strictly on the concrete evidence present in the state history, is the user's primary goal satisfied?",
                 ),
-                "needs_synthesis": Noul(
-                    instructions="Does the current step require open-ended creative writing, complex script synthesis, or novel reasoning?",
+                "evidence_sufficient": Choice(
+                    instructions="Is the evidence in state sufficient to evaluate task completion, or is evidence insufficient?",
+                    criteria={
+                        "sufficient": "Evidence is clearly present in execution history to make a definitive judgement.",
+                        "insufficient": "Evidence is incomplete, ambiguous, or missing.",
+                    },
+                ),
+                "needs_writing": Noul(
+                    instructions="Does the current step require open-ended prose, essay, or creative writing that no tool can produce?",
+                ),
+                "needs_code": Noul(
+                    instructions="Does the current step require authoring or synthesizing new code rather than executing an existing tool?",
+                ),
+                "needs_explanation": Noul(
+                    instructions="Does the outcome require being explained in natural language words to the user?",
                 ),
             }
             
@@ -138,22 +185,73 @@ class JevSystemOneClient:
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             
             choice_ans: ChoiceAnswer = response.choices["route"]
-            noul_finish: NoulAnswer = response.nouls["is_finished"]
-            noul_synth: NoulAnswer = response.nouls["needs_synthesis"]
+            goal_sat_ans: NoulAnswer = response.nouls["goal_satisfied"]
+            evidence_ans: ChoiceAnswer = response.choices.get(
+                "evidence_sufficient",
+                ChoiceAnswer(choice="sufficient", confidence=1.0, probabilities={"sufficient": 1.0}),
+            )
+            needs_writing_ans: NoulAnswer = response.nouls["needs_writing"]
+            needs_code_ans: NoulAnswer = response.nouls["needs_code"]
+            needs_explanation_ans: NoulAnswer = response.nouls["needs_explanation"]
 
             selected = choice_ans.choice
-            confidence = choice_ans.confidence or 0.90
-            probs = choice_ans.probabilities or {selected: confidence}
-            
-            is_terminal = (noul_finish.noul > 0.85) or (selected == "finish_task")
-            needs_gen = (noul_synth.noul > 0.70) or (selected == "escalate_to_system_two")
+            dist_conf = choice_ans.confidence
+            probs = choice_ans.probabilities
+
+            if not probs:
+                # Do not fabricate {selected: confidence}. Missing probabilities
+                # must escalate to System 2 because distribution concentration is unknown.
+                return JevDecision(
+                    selected_tool="escalate_to_system_two",
+                    confidence=0.0,
+                    option_probability=0.0,
+                    distribution_confidence=float(dist_conf) if dist_conf is not None else 0.0,
+                    probabilities={},
+                    is_terminal=False,
+                    needs_generation=True,
+                    latency_ms=elapsed_ms,
+                    simulated=False,
+                )
+
+            opt_prob = float(probs.get(selected, 0.0))
+            dist_concentration = float(dist_conf) if dist_conf is not None else 0.0
+
+            # Two-condition gate: floor on option probability AND floor on concentration
+            two_condition_gate_cleared = (
+                opt_prob >= THRESHOLD_OPTION_PROBABILITY
+                and dist_concentration >= THRESHOLD_DISTRIBUTION_CONCENTRATION
+            )
+
+            # Combined per-factor synthesis flags
+            writing_flag = needs_writing_ans.noul >= THRESHOLD_NEEDS_WRITING
+            code_flag = needs_code_ans.noul >= THRESHOLD_NEEDS_CODE
+            explanation_flag = needs_explanation_ans.noul >= THRESHOLD_NEEDS_EXPLANATION
+
+            needs_gen = (
+                writing_flag
+                or code_flag
+                or explanation_flag
+                or (selected == "escalate_to_system_two")
+                or not two_condition_gate_cleared
+            )
+
+            evidence_is_sufficient = getattr(evidence_ans, "choice", "sufficient") == "sufficient"
+            goal_satisfied = (goal_sat_ans.noul >= THRESHOLD_GOAL_SATISFIED) and evidence_is_sufficient
+            is_terminal = (goal_satisfied or (selected == "finish_task")) and evidence_is_sufficient
 
             return JevDecision(
                 selected_tool=selected,
-                confidence=confidence,
+                confidence=min(opt_prob, dist_concentration),
+                option_probability=opt_prob,
+                distribution_confidence=dist_concentration,
                 probabilities=probs,
                 is_terminal=is_terminal,
                 needs_generation=needs_gen,
+                needs_writing=writing_flag,
+                needs_code=code_flag,
+                needs_explanation=explanation_flag,
+                goal_satisfied=goal_satisfied,
+                evidence_sufficient=evidence_is_sufficient,
                 latency_ms=elapsed_ms,
                 simulated=False,
             )

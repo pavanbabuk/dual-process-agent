@@ -11,7 +11,10 @@ from dual_agent.config import AgentConfig, load_config, save_config
 from dual_agent.mcp_manager import MCPManager
 from dual_agent.shell import InteractiveShell
 
+__version__ = "2.0.0"
+
 __all__ = [
+    "__version__",
     "AgentState",
     "StepRecord",
     "StepType",

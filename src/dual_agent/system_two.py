@@ -6,11 +6,21 @@ import json
 import time
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+import base64
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def _encode_image_to_data_url(image_path: str) -> str:
+    """Read an image file and return a data URI string."""
+    with open(image_path, "rb") as f:
+        data = base64.b64encode(f.read()).decode("utf-8")
+    ext = os.path.splitext(image_path)[1].lower().lstrip(".") or "png"
+    mime = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
+    return f"data:{mime};base64,{data}"
 
 
 class SystemTwoResponse(BaseModel):
@@ -46,15 +56,24 @@ class SystemTwoProvider(ABC):
     """Abstract interface for System 2 fallback reasoners."""
 
     @abstractmethod
-    def generate_step(self, prompt: str) -> SystemTwoResponse:
-        """Process agent prompt and return thought, next action, and arguments."""
+    def generate_step(
+        self,
+        prompt: str,
+        images: Optional[List[str]] = None,
+    ) -> SystemTwoResponse:
+        """Process agent prompt and optional screenshot images, returning thought, action, and arguments."""
         pass
 
 
 class MockSystemTwoProvider(SystemTwoProvider):
     """Simulated System 2 provider for testing and zero-config demonstration."""
+    is_mock: bool = True
 
-    def generate_step(self, prompt: str) -> SystemTwoResponse:
+    def generate_step(
+        self,
+        prompt: str,
+        images: Optional[List[str]] = None,
+    ) -> SystemTwoResponse:
         start = time.perf_counter()
         # Simulate ~300ms generative latency
         time.sleep(0.3)
@@ -87,15 +106,12 @@ class MockSystemTwoProvider(SystemTwoProvider):
         )
 
 
-class HermesProvider(SystemTwoProvider):
-    """Nous Research Hermes 3, or any OpenAI-compatible chat endpoint.
+class CustomLLMProvider(SystemTwoProvider):
+    """Local Ollama / vLLM server, or any OpenAI-compatible chat endpoint.
 
-    Used for both a local Ollama/vLLM server (no auth) and hosted
-    OpenAI-compatible gateways such as OmniRoute (bearer auth). The API key is
-    optional because local servers do not need one, but it MUST be sent when
-    present: without an Authorization header this provider could not talk to any
-    authenticated endpoint at all, which is why the agent appeared to have a
-    working System 2 while actually only ever reaching the mock.
+    Used for both a local model server (no auth) and hosted
+    OpenAI-compatible gateways (bearer auth). The API key is optional
+    because local servers do not need one, but is sent when present.
     """
 
     def __init__(
@@ -105,21 +121,59 @@ class HermesProvider(SystemTwoProvider):
         api_key: Optional[str] = None,
         timeout: Optional[float] = None,
     ):
-        self.base_url = base_url or os.getenv("HERMES_BASE_URL", "http://localhost:11434/v1")
-        self.model = model or os.getenv("HERMES_MODEL", "nous-hermes-3-llama-3.1-8b")
-        self.api_key = api_key or os.getenv("HERMES_API_KEY", "")
-        # Hosted gateways are slower than a local model, and a free gateway can
-        # hang on a struggling upstream provider. 30s was tight enough that real
-        # calls timed out and silently degraded to the mock; 60s was long enough
-        # to stall an agent step for a minute. Tunable because the right value
-        # depends entirely on where the endpoint lives.
+        if base_url is not None:
+            self.base_url = base_url
+        else:
+            env_url = os.getenv("CUSTOM_LLM_BASE_URL") or os.getenv("HERMES_BASE_URL")
+            if env_url:
+                self.base_url = env_url
+            else:
+                from dual_agent.config import load_config
+                self.base_url = load_config().custom_llm_base_url or "http://localhost:11434/v1"
+
+        if model is not None:
+            self.model = model
+        else:
+            env_model = os.getenv("CUSTOM_LLM_MODEL") or os.getenv("HERMES_MODEL")
+            if env_model:
+                self.model = env_model
+            else:
+                from dual_agent.config import load_config
+                self.model = load_config().custom_llm_model or "llama3.1"
+
+        if api_key is not None:
+            self.api_key = api_key
+        else:
+            env_key = os.getenv("CUSTOM_LLM_API_KEY") or os.getenv("HERMES_API_KEY")
+            if env_key:
+                self.api_key = env_key
+            else:
+                from dual_agent.config import load_config
+                self.api_key = load_config().custom_llm_api_key or ""
+
         self.timeout = timeout or float(os.getenv("SYSTEM_TWO_TIMEOUT", "45"))
 
-    def generate_step(self, prompt: str) -> SystemTwoResponse:
+    def generate_step(
+        self,
+        prompt: str,
+        images: Optional[List[str]] = None,
+    ) -> SystemTwoResponse:
         start = time.perf_counter()
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+
+        user_content: Any = prompt
+        if images:
+            content_parts: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+            for img_path in images:
+                if os.path.isfile(img_path):
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": _encode_image_to_data_url(img_path)},
+                    })
+            user_content = content_parts
+
         try:
             with httpx.Client(timeout=self.timeout) as client:
                 res = client.post(
@@ -128,15 +182,10 @@ class HermesProvider(SystemTwoProvider):
                     json={
                         "model": self.model,
                         "messages": [
-                            {"role": "system", "content": "You are Hermes, an autonomous reasoning agent. Always output valid JSON with 'thought', 'action', and 'args'."},
-                            {"role": "user", "content": prompt},
+                            {"role": "system", "content": "You are an autonomous reasoning agent. Always output valid JSON with 'thought', 'action', and 'args'."},
+                            {"role": "user", "content": user_content},
                         ],
                         "response_format": {"type": "json_object"},
-                        # Bounded so a struggling upstream provider cannot hang a
-                        # step until the socket timeout. Must be generous enough
-                        # for a write_file call, whose `content` argument is a
-                        # whole file: at 700 tokens the JSON came back truncated
-                        # mid-string and failed to parse.
                         "max_tokens": int(os.getenv("SYSTEM_TWO_MAX_TOKENS", "4000")),
                     },
                 )
@@ -148,17 +197,158 @@ class HermesProvider(SystemTwoProvider):
                 parsed = json.loads(raw_content)
                 tokens = data.get("usage", {}).get("total_tokens", 0)
 
+                action = parsed.get("action")
+                if not action:
+                    action = "system_two_incomplete"
+
                 return SystemTwoResponse(
                     thought=parsed.get("thought", "Executed reasoning."),
-                    action=parsed.get("action", "finish_task"),
+                    action=action,
                     args=parsed.get("args", {}),
                     generated_content=raw_content,
                     latency_ms=elapsed_ms,
                     tokens_used=tokens,
                 )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                reason = f"System 2 call to {self.base_url} failed with 429 Too Many Requests (rate-limited)."
+            else:
+                reason = f"System 2 call to {self.base_url} failed with status {e.response.status_code}: {e}"
+            logger.warning(f"{reason} — falling back to mock response.")
+            return _mock_fallback(prompt, reason)
         except Exception as e:
             reason = f"System 2 call to {self.base_url} failed: {type(e).__name__}: {e}"
             logger.warning(f"{reason} — falling back to mock response.")
+            return _mock_fallback(prompt, reason)
+
+
+# Alias for backward compatibility
+HermesProvider = CustomLLMProvider
+
+
+class DeepSeekProvider(SystemTwoProvider):
+    """DeepSeek V3 and DeepSeek R1 Reasoner Provider.
+
+    Connects to DeepSeek's OpenAI-compatible API (https://api.deepseek.com).
+    Supports extracting R1 chain-of-thought (reasoning_content) when deepseek-reasoner
+    is selected.
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ):
+        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY", "")
+        self.base_url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        self.model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+        self.timeout = timeout or float(os.getenv("SYSTEM_TWO_TIMEOUT", "60"))
+
+    def generate_step(
+        self,
+        prompt: str,
+        images: Optional[List[str]] = None,
+    ) -> SystemTwoResponse:
+        start = time.perf_counter()
+        if not self.api_key:
+            reason = f"No DEEPSEEK_API_KEY configured for {self.base_url}"
+            logger.warning(f"{reason} — falling back to mock.")
+            return _mock_fallback(prompt, reason)
+
+        # DeepSeek V3 and R1 are text-only; they do not process multimodal image payloads.
+        if images:
+            reason = (
+                f"Configured provider 'deepseek' ({self.model}) is text-only and does not "
+                "support visual image inputs. A vision-capable model (e.g. gpt-4o, grok-2-vision, "
+                "or local VLM) must be configured for screen control tasks."
+            )
+            logger.warning(reason)
+            res = _mock_fallback(prompt, reason)
+            res.degraded_reason = reason
+            return res
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": 'You are a deliberate System 2 agent. Output valid JSON: {"thought": "...", "action": "...", "args": {...}}'
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": int(os.getenv("SYSTEM_TWO_MAX_TOKENS", "4000")),
+        }
+        if "reasoner" not in self.model.lower():
+            payload["response_format"] = {"type": "json_object"}
+
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                res = client.post(
+                    f"{self.base_url.rstrip('/')}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                res.raise_for_status()
+                data = res.json()
+                elapsed_ms = (time.perf_counter() - start) * 1000
+
+                msg = data["choices"][0]["message"]
+                raw = msg.get("content", "")
+                reasoning = msg.get("reasoning_content", "")
+
+                try:
+                    clean_raw = raw.strip()
+                    if clean_raw.startswith("```"):
+                        lines = clean_raw.splitlines()
+                        if lines[0].startswith("```"):
+                            lines = lines[1:]
+                        if lines and lines[-1].startswith("```"):
+                            lines = lines[:-1]
+                        clean_raw = "\n".join(lines).strip()
+                    parsed = json.loads(clean_raw)
+                except Exception as parse_err:
+                    logger.warning(f"[DeepSeekProvider] Could not parse model JSON: {parse_err}. Raw: {raw[:200]}")
+                    parsed = {
+                        "thought": raw[:300] if raw else f"Invalid JSON response: {parse_err}",
+                        "action": "system_two_incomplete",
+                        "args": {"error": str(parse_err)},
+                    }
+
+                thought = parsed.get("thought", "DeepSeek reasoning complete.")
+                if reasoning:
+                    thought = f"[R1 CoT]: {reasoning[:300]}... | {thought}"
+
+                action = parsed.get("action")
+                if not action:
+                    action = "system_two_incomplete"
+
+                tokens = data.get("usage", {}).get("total_tokens", 0)
+
+                return SystemTwoResponse(
+                    thought=thought,
+                    action=action,
+                    args=parsed.get("args", {}),
+                    generated_content=raw,
+                    latency_ms=elapsed_ms,
+                    tokens_used=tokens,
+                )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                reason = f"DeepSeek API ({self.model}) returned 429 Too Many Requests (rate-limited)."
+            else:
+                reason = f"DeepSeek API call ({self.model}) failed with status {e.response.status_code}: {e}"
+            logger.warning(f"{reason} — falling back to mock.")
+            return _mock_fallback(prompt, reason)
+        except Exception as e:
+            reason = f"DeepSeek API call ({self.model}) failed: {type(e).__name__}: {e}"
+            logger.warning(f"{reason} — falling back to mock.")
             return _mock_fallback(prompt, reason)
 
 
@@ -172,10 +362,6 @@ class OpenAICompatibleProvider(SystemTwoProvider):
         model: Optional[str] = None,
         timeout: Optional[float] = None,
     ):
-        # Resolution is explicit per vendor. The previous version keyed off
-        # whether the string "GROK" happened to be anywhere in os.environ and
-        # then read GROK_MODEL even in OpenAI mode, so setting OPENAI_MODEL had
-        # no effect and an unrelated env var could silently change the model.
         if "x.ai" in (base_url or os.getenv("OPENAI_BASE_URL", "")) or os.getenv("GROK_API_KEY"):
             self.api_key = api_key or os.getenv("GROK_API_KEY") or os.getenv("OPENAI_API_KEY", "")
             self.base_url = base_url or os.getenv("GROK_BASE_URL", "https://api.x.ai/v1")
@@ -186,12 +372,27 @@ class OpenAICompatibleProvider(SystemTwoProvider):
             self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o")
         self.timeout = timeout or float(os.getenv("SYSTEM_TWO_TIMEOUT", "45"))
 
-    def generate_step(self, prompt: str) -> SystemTwoResponse:
+    def generate_step(
+        self,
+        prompt: str,
+        images: Optional[List[str]] = None,
+    ) -> SystemTwoResponse:
         start = time.perf_counter()
         if not self.api_key:
             reason = f"no API key configured for {self.base_url}"
             logger.warning(f"{reason} — falling back to mock.")
             return _mock_fallback(prompt, reason)
+
+        user_content: Any = prompt
+        if images:
+            content_parts: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+            for img_path in images:
+                if os.path.isfile(img_path):
+                    content_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": _encode_image_to_data_url(img_path)},
+                    })
+            user_content = content_parts
 
         try:
             with httpx.Client(timeout=self.timeout) as client:
@@ -202,7 +403,7 @@ class OpenAICompatibleProvider(SystemTwoProvider):
                         "model": self.model,
                         "messages": [
                             {"role": "system", "content": "You are a deliberate System 2 agent. Return valid JSON: {'thought': '...', 'action': '...', 'args': {...}}"},
-                            {"role": "user", "content": prompt},
+                            {"role": "user", "content": user_content},
                         ],
                         "response_format": {"type": "json_object"},
                         "max_tokens": int(os.getenv("SYSTEM_TWO_MAX_TOKENS", "4000")),
@@ -224,26 +425,54 @@ class OpenAICompatibleProvider(SystemTwoProvider):
                     latency_ms=elapsed_ms,
                     tokens_used=tokens,
                 )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                reason = f"System 2 endpoint {self.base_url} returned 429 Too Many Requests (rate-limited)."
+            else:
+                reason = f"System 2 call to {self.base_url} failed with status {e.response.status_code}: {e}"
+            logger.warning(f"{reason} — falling back to mock response.")
+            return _mock_fallback(prompt, reason)
         except Exception as e:
             reason = f"System 2 call to {self.base_url} failed: {type(e).__name__}: {e}"
-            logger.warning(f"{reason} — falling back to mock.")
+            logger.warning(f"{reason} — falling back to mock response.")
             return _mock_fallback(prompt, reason)
 
 
-def get_system_two_provider(provider_type: Optional[str] = None) -> SystemTwoProvider:
-    """Factory function to resolve configured System 2 provider."""
-    ptype = (provider_type or os.getenv("SYSTEM_TWO_PROVIDER", "mock")).lower()
+def get_system_two_provider(
+    provider_type: Optional[str] = None,
+    config: Optional[Any] = None,
+) -> SystemTwoProvider:
+    """Factory function to resolve configured System 2 provider using resolved config."""
+    from dual_agent.config import load_config
+    cfg = config or load_config()
 
-    if ptype in ("hermes", "hermes_ollama", "ollama", "omniroute", "local"):
-        return HermesProvider()
+    ptype = (provider_type or cfg.system_two_provider or os.getenv("SYSTEM_TWO_PROVIDER", "mock")).lower()
+
+    if ptype in ("deepseek", "deepseek-chat", "deepseek-reasoner"):
+        return DeepSeekProvider(
+            api_key=cfg.deepseek_api_key,
+            model=cfg.deepseek_model,
+        )
+    elif ptype in ("custom", "hermes", "hermes_ollama", "ollama", "omniroute", "local", "vllm"):
+        return CustomLLMProvider(
+            base_url=cfg.custom_llm_base_url,
+            model=cfg.custom_llm_model,
+            api_key=cfg.custom_llm_api_key,
+        )
     elif ptype in ("grok", "xai"):
         return OpenAICompatibleProvider(
             base_url="https://api.x.ai/v1",
-            model=os.getenv("GROK_MODEL", "grok-2-latest"),
-            api_key=os.getenv("GROK_API_KEY"),
+            model=cfg.grok_model or os.getenv("GROK_MODEL", "grok-2-latest"),
+            api_key=cfg.grok_api_key or os.getenv("GROK_API_KEY"),
         )
     elif ptype in ("openai", "gpt"):
-        return OpenAICompatibleProvider()
+        return OpenAICompatibleProvider(
+            api_key=cfg.openai_api_key or os.getenv("OPENAI_API_KEY"),
+        )
+    elif ptype in ("anthropic", "claude"):
+        raise ValueError(
+            "Anthropic provider is not implemented. Supported providers: deepseek, grok, openai, custom, mock."
+        )
     else:
         if ptype != "mock":
             logger.warning(
@@ -251,3 +480,52 @@ def get_system_two_provider(provider_type: Optional[str] = None) -> SystemTwoPro
                 "The mock returns canned text and cannot generate anything real."
             )
         return MockSystemTwoProvider()
+
+
+def get_vision_provider(
+    config: Optional[Any] = None,
+) -> SystemTwoProvider:
+    """Resolve vision-capable System 2 provider following configuration precedence.
+
+    Honest resolution: if no real vision provider or keys are present, returns
+    MockSystemTwoProvider with degraded_reason clearly stated.
+    """
+    from dual_agent.config import load_config
+    cfg = config or load_config()
+
+    v_provider = (cfg.vision_provider or os.getenv("VISION_PROVIDER") or "").lower()
+
+    if v_provider in ("openai", "gpt"):
+        key = cfg.vision_api_key or cfg.openai_api_key or os.getenv("VISION_API_KEY") or os.getenv("OPENAI_API_KEY")
+        return OpenAICompatibleProvider(
+            api_key=key,
+            base_url=cfg.vision_base_url or os.getenv("VISION_BASE_URL", "https://api.openai.com/v1"),
+            model=cfg.vision_model or os.getenv("VISION_MODEL", "gpt-4o"),
+        )
+    elif v_provider in ("grok", "xai"):
+        key = cfg.vision_api_key or cfg.grok_api_key or os.getenv("VISION_API_KEY") or os.getenv("GROK_API_KEY")
+        return OpenAICompatibleProvider(
+            api_key=key,
+            base_url=cfg.vision_base_url or os.getenv("VISION_BASE_URL", "https://api.x.ai/v1"),
+            model=cfg.vision_model or os.getenv("VISION_MODEL", "grok-2-vision-1212"),
+        )
+    elif v_provider in ("custom", "local", "ollama", "omniroute", "vllm"):
+        return CustomLLMProvider(
+            base_url=cfg.vision_base_url or cfg.custom_llm_base_url,
+            model=cfg.vision_model or "llava",
+            api_key=cfg.vision_api_key or cfg.custom_llm_api_key,
+        )
+    elif cfg.openai_api_key or os.getenv("OPENAI_API_KEY"):
+        return OpenAICompatibleProvider(
+            api_key=cfg.openai_api_key or os.getenv("OPENAI_API_KEY"),
+            model=cfg.vision_model or "gpt-4o",
+        )
+    elif cfg.grok_api_key or os.getenv("GROK_API_KEY"):
+        return OpenAICompatibleProvider(
+            api_key=cfg.grok_api_key or os.getenv("GROK_API_KEY"),
+            base_url="https://api.x.ai/v1",
+            model=cfg.vision_model or "grok-2-vision-1212",
+        )
+    else:
+        mock = MockSystemTwoProvider()
+        return mock

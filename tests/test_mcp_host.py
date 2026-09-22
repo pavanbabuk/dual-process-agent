@@ -33,3 +33,17 @@ def test_mcp_host_custom_tool():
     res = host.execute_tool("multiply", {"a": 6, "b": 7})
     assert res.success is True
     assert res.output == 42
+
+
+def test_read_file_large_file_has_explicit_truncation_marker(tmp_path):
+    large_file = tmp_path / "large_file.txt"
+    content = "A" * 15000
+    large_file.write_text(content, encoding="utf-8")
+
+    host = MCPHost()
+    res = host.execute_tool("read_file", {"path": str(large_file)})
+    assert res.success is True
+    assert "truncated" in res.output.lower(), f"Expected truncation marker in output, got: {res.output[-100:]}"
+    assert "15000" in res.output
+    assert "5000" in res.output
+

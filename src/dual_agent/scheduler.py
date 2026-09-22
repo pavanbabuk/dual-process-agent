@@ -109,6 +109,58 @@ def parse_nl_to_cron(description: str) -> Optional[str]:
 # Scheduler
 # ---------------------------------------------------------------------------
 
+MONTH_NAMES = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+DOW_NAMES = {
+    "sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6, "7": 0,
+}
+
+
+def _field_matches(
+    expr: str,
+    value: int,
+    name_map: Optional[Dict[str, int]] = None,
+    min_val: int = 0,
+    max_val: int = 59,
+) -> bool:
+    """Evaluate a single cron field against an integer value."""
+    expr = expr.strip().lower()
+    if expr == "*":
+        return True
+
+    if "," in expr:
+        return any(
+            _field_matches(sub, value, name_map, min_val, max_val)
+            for sub in expr.split(",")
+        )
+
+    if name_map:
+        for name, num in name_map.items():
+            expr = re.sub(rf"\b{name}\b", str(num), expr)
+
+    step = 1
+    if "/" in expr:
+        parts = expr.split("/", 1)
+        expr = parts[0]
+        step = int(parts[1])
+
+    if expr == "*":
+        start, end = min_val, max_val
+    elif "-" in expr:
+        range_parts = expr.split("-", 1)
+        start, end = int(range_parts[0]), int(range_parts[1])
+    else:
+        if step == 1:
+            return value == int(expr)
+        start, end = int(expr), max_val
+
+    if start <= value <= end:
+        return (value - start) % step == 0
+    return False
+
+
 class CronScheduler:
     """Stores and dispatches scheduled agent jobs via SQLite + asyncio."""
 
@@ -206,27 +258,22 @@ class CronScheduler:
                 self._run_job(job)
 
     def _is_due(self, cron_expr: str, last_run_at: Optional[str], now: datetime.datetime) -> bool:
-        """Very lightweight cron-due check (minute-resolution)."""
+        """Evaluate if cron expression is due at the given datetime."""
         try:
             parts = cron_expr.strip().split()
             if len(parts) != 5:
                 return False
             minute_e, hour_e, dom_e, month_e, dow_e = parts
 
-            def matches(expr: str, value: int) -> bool:
-                if expr == "*":
-                    return True
-                if expr.startswith("*/"):
-                    step = int(expr[2:])
-                    return value % step == 0
-                return str(value) == expr
+            # Weekday in standard cron: 0=Sun, 1=Mon, ..., 6=Sat
+            dow_val = now.weekday() + 1 if now.weekday() < 6 else 0
 
             if not (
-                matches(minute_e, now.minute)
-                and matches(hour_e, now.hour)
-                and matches(dom_e, now.day)
-                and matches(month_e, now.month)
-                and matches(dow_e, now.weekday() + 1 if now.weekday() < 6 else 0)
+                _field_matches(minute_e, now.minute, min_val=0, max_val=59)
+                and _field_matches(hour_e, now.hour, min_val=0, max_val=23)
+                and _field_matches(dom_e, now.day, min_val=1, max_val=31)
+                and _field_matches(month_e, now.month, name_map=MONTH_NAMES, min_val=1, max_val=12)
+                and _field_matches(dow_e, dow_val, name_map=DOW_NAMES, min_val=0, max_val=7)
             ):
                 return False
 
@@ -236,7 +283,8 @@ class CronScheduler:
                 if (now - last).total_seconds() < 55:
                     return False
             return True
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[Scheduler] _is_due error on '{cron_expr}': {e}")
             return False
 
     def _run_job(self, job: Dict[str, Any]) -> None:
