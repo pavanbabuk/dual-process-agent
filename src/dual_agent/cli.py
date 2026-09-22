@@ -107,6 +107,12 @@ def main():
         run_configuration_wizard()
         return
 
+    # If first argument is 'update', run self-updater
+    if sys.argv[1].lower() in ("update", "--update"):
+        from dual_agent.updater import perform_update
+        perform_update()
+        return
+
     parser = argparse.ArgumentParser(description="Run Dual-Process Agent with Jev and MCP.")
     parser.add_argument(
         "positional_goal",

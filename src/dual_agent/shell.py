@@ -90,6 +90,10 @@ class InteractiveShell:
             self.dispatcher.s1 = self.s1
             self.dispatcher.s2 = self.s2
 
+        elif cmd_lower in ("/update", "update"):
+            from dual_agent.updater import perform_update
+            perform_update()
+
         elif cmd_lower in ("/clear", "clear"):
             console.clear()
             self.print_welcome()
@@ -108,6 +112,7 @@ class InteractiveShell:
         table.add_row("/tools", "List all registered MCP tools and their descriptions")
         table.add_row("/memory", "View learned skills and cumulative performance stats")
         table.add_row("/config", "Open interactive configuration wizard")
+        table.add_row("/update", "Pull latest updates from GitHub and upgrade dependencies")
         table.add_row("/clear", "Clear screen and reset active view")
         table.add_row("/exit", "Quit the interactive shell")
         table.add_row("<text>", "Any natural language goal or programming instruction")
