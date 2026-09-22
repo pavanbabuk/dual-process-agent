@@ -72,10 +72,14 @@ def load_config() -> AgentConfig:
 
 
 def save_config(config: AgentConfig) -> str:
-    """Save configuration to ~/.dual_agent/config.json."""
+    """Save configuration to ~/.dual_agent/config.json with strict 0600 permissions."""
     cfg_path = get_config_file_path()
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(config.model_dump(), f, indent=2)
+    try:
+        os.chmod(cfg_path, 0o600)
+    except Exception:
+        pass
     return cfg_path
 
 

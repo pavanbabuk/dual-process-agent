@@ -16,9 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 def get_default_data_dir() -> str:
-    """Returns ~/.dual_agent or DUAL_AGENT_HOME environment directory."""
+    """Returns ~/.dual_agent or DUAL_AGENT_HOME environment directory with strict 0700 permissions."""
     path = os.getenv("DUAL_AGENT_HOME", os.path.expanduser("~/.dual_agent"))
-    os.makedirs(path, exist_ok=True)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except Exception:
+        pass
     return path
 
 
