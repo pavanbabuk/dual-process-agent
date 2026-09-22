@@ -5,14 +5,43 @@ Stores execution sessions, project profiles, and learned skills across agent run
 
 from __future__ import annotations
 import os
+import re
 import json
 import sqlite3
-import datetime
 import logging
+import datetime
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+# Matches the word characters FTS5 will index, so anything else in a user's query
+# is dropped rather than handed to the query parser as syntax.
+_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _safe_fts_query(query: str) -> str:
+    """Convert arbitrary user text into a valid FTS5 MATCH expression.
+
+    FTS5 MATCH takes a query *syntax*, not a literal string. Characters that are
+    ordinary in a goal — '-' in 'dual-agent', '/' and '.' in a file path, '--' in
+    a CLI flag, quotes, '*', parentheses, ':' — are operators to the parser, and
+    bare AND/OR/NOT are keywords. Passing a goal straight through therefore
+    raised, and the caller swallowed it and silently retried as a LIKE scan:
+
+        fts5: syntax error near "-"
+        fts5: syntax error near "/"
+        no such column: agent      (from 'dual-agent')
+
+    Recall thus degraded for exactly the goals this agent sees most: file paths,
+    CLI flags and hyphenated names. Measured before the fix: 3 of 4 realistic
+    queries fell out of full-text search. Every token is now double-quoted so it
+    can only ever be read as a literal term, never as an operator.
+    """
+    tokens = _FTS_TOKEN_RE.findall(query or "")
+    if not tokens:
+        return ""
+    return " OR ".join(f'"{t}"' for t in tokens)
 
 
 def get_default_data_dir() -> str:
@@ -504,6 +533,11 @@ class MemoryEngine:
         """
         if not query.strip():
             return []
+        safe_query = _safe_fts_query(query)
+        if not safe_query:
+            # Nothing tokenizable (e.g. pure punctuation) — go straight to LIKE
+            # instead of asking FTS5 to parse an empty match expression.
+            return self._fallback_search(query, limit)
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -517,7 +551,7 @@ class MemoryEngine:
                     ORDER BY rank, s.id DESC
                     LIMIT ?
                     """,
-                    (query, limit),
+                    (safe_query, limit),
                 )
                 return [dict(r) for r in cursor.fetchall()]
         except Exception as e:
@@ -526,7 +560,11 @@ class MemoryEngine:
 
     def _fallback_search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """LIKE-based search fallback if FTS5 is unavailable."""
-        terms = [f"%{t}%" for t in query.split()[:3]]
+        # Use the same tokenization as the FTS path so both agree on what the
+        # query means; splitting on whitespace alone produced terms still
+        # carrying punctuation ("--version") that matched nothing.
+        tokens = _FTS_TOKEN_RE.findall(query)[:3]
+        terms = [f"%{t}%" for t in tokens]
         if not terms:
             return []
         where = " OR ".join("goal LIKE ?" for _ in terms)

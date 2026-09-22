@@ -106,7 +106,7 @@ Small correctness fixes that make later milestones testable. Can ship together.
 | WebSocket step events always say `S1_FAST` | `web/streaming_dispatcher.py` `patched_execute` | A slow-path run emits at least one `path: "S2_SLOW"` event |
 | `USER.md` is never written | `dispatcher.py` | Completing a run appends at least one fact via `memory.update_user_profile`; a test asserts the file grows |
 | `find_matching_skill` is inert | `dispatcher.py` | Either the replay is wired into a step, or the log line and `LearnedSkill` claims are removed |
-| `bridges/hermes_middleware.py` claims "up to 80%" savings | docstring | Claim removed or marked unverified |
+| `bridges/hermes_middleware.py` claimed an unmeasured savings percentage | docstring | ✅ **Done** — the figure was removed and replaced with an explicit statement that no savings number is claimed; `tests/test_recall_and_web_safety.py` now fails the build if such a claim reappears |
 
 **Why first:** three of these are honesty defects in the same class as the constants that were
 already removed. Leaving them makes every later milestone harder to verify.

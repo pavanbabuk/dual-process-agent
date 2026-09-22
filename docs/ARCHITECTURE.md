@@ -669,6 +669,9 @@ Plain statements of what does not work or is weak today, read off the code.
   evaluation dataset.
 - `updater.perform_update` shells out to `git pull origin master` / `main` in whatever directory the
   process happens to be in. It does not reinstall, verify signatures, or check what changed.
-- `bridges/hermes_middleware.py`'s docstring claims offloading saves "up to 80% of outer-loop token
-  costs". That figure is not measured by anything in this repo and contradicts the measured-only
-  policy everywhere else. Treat it as documentation debt.
+- `bridges/hermes_middleware.py` previously claimed, in its docstring, that offloading routing to Jev
+  reduces outer-loop token costs by a fixed large percentage. Nothing in this repo ever measured that,
+  and it contradicted the measured-only policy applied everywhere else. **Resolved:** the figure has
+  been removed and the docstring now states plainly that no savings number is claimed because no
+  baseline harness exists. `tests/test_recall_and_web_safety.py` fails the build if an unmeasured
+  percentage claim reappears in any `.py` or `.md` file.

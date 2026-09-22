@@ -69,7 +69,15 @@ def create_app(
     s1 = JevSystemOneClient(
         api_key=cfg.typesafe_api_key,
         base_url=cfg.typesafe_base_url,
-        force_simulation=True,
+        # Previously hardcoded to True, which meant the dashboard could never
+        # exercise real Jev routing: opening the UI always showed simulated
+        # decisions even with a valid key configured, with nothing in the UI to
+        # explain why. Now it goes live when a key exists, and simulation remains
+        # available and explicit via DUAL_AGENT_UI_FORCE_SIMULATION=true.
+        force_simulation=(
+            os.getenv("DUAL_AGENT_UI_FORCE_SIMULATION", "false").lower() == "true"
+            or not cfg.typesafe_api_key
+        ),
     )
     s2 = get_system_two_provider(cfg.system_two_provider)
     dispatcher = DualProcessDispatcher(

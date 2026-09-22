@@ -1,8 +1,14 @@
 """Integration Middleware for Nous Research Hermes Agent.
 
 This module allows Hermes Agent instances (or any LangChain / CrewAI / ReAct loop)
-to offload routine tool routing and loop-termination checks to TypeSafe AI's Jev model,
-saving up to 80% of outer-loop token costs.
+to offload routine tool routing and loop-termination checks to TypeSafe AI's Jev model.
+
+Routing a decision to Jev is billed per input token, and it is far cheaper per call
+than a frontier LLM completion. How much that saves on a given workload is NOT
+measured here — this repository contains no baseline harness, so no savings figure
+is claimed. An earlier revision of this docstring asserted "up to 80% of outer-loop
+token costs", which nothing in this project ever measured; it was removed rather
+than left standing as an unverifiable number.
 """
 
 from __future__ import annotations

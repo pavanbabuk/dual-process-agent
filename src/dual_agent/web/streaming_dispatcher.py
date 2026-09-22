@@ -88,7 +88,18 @@ class WebPermissionBroker(PermissionBroker):
         finally:
             _pending_approvals.pop(request_id, None)
 
-        decision = ApprovalDecision(decision_str)
+        # The decision arrives over a WebSocket, so it is untrusted input: a
+        # malformed or unrecognised string must not raise out of here and abort
+        # the run. Unknown values fall back to deny, which is the safe default
+        # for a tool that was awaiting permission.
+        try:
+            decision = ApprovalDecision(decision_str)
+        except ValueError:
+            logger.warning(
+                f"[WebPermission] Unrecognised approval decision {decision_str!r}; denying."
+            )
+            decision = ApprovalDecision.DENY
+
         if decision == ApprovalDecision.ALLOW_SESSION:
             self._session_allowed.add(tool_name)
         return decision, edited_args
