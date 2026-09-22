@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dual-agent"
-version = "0.1.0"
-description = "Dual-Process Agent Runtime combining TypeSafe AI Jev (System 1) with MCP and System 2 LLMs (Hermes, Grok, Claude)"
+version = "2.0.0"
+description = "Dual-Process Agent: TypeSafe AI Jev (System 1) + MCP + System 2 LLMs with self-improving skills, FTS5 recall, permission broker, Telegram gateway, and cron scheduler"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,6 +21,22 @@ dev = [
     "pytest>=8.0.0",
     "pytest-cov>=5.0.0",
 ]
+gateway = [
+    "python-telegram-bot>=21.0",
+]
+ui = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "jinja2>=3.1.0",
+    "python-multipart>=0.0.9",
+]
+all = [
+    "python-telegram-bot>=21.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "jinja2>=3.1.0",
+    "python-multipart>=0.0.9",
+]
 
 [project.scripts]
 dual-agent = "dual_agent.cli:main"
@@ -28,8 +44,14 @@ dual-agent = "dual_agent.cli:main"
 [tool.setuptools.package-dir]
 "" = "src"
 
+# `bridges` is a top-level package at the repo root, not under src/. It is
+# imported at runtime (tests and the Hermes middleware bridge), but the previous
+# config declared src as the only package root WITHOUT listing `bridges`, so it
+# was never actually installed — `import bridges` only worked because a stale
+# editable checkout happened to be on sys.path via a leftover .pth file.
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["dual_agent*", "bridges*"]
 
 [tool.pytest.ini_options]
 pythonpath = [".", "src"]

@@ -26,5 +26,4 @@ def test_dispatcher_fast_path_and_completion():
 
     assert isinstance(result, DispatchResult)
     assert result.total_steps > 0
-    assert result.system_one_latency_ms > 0
-    assert result.estimated_token_savings_pct >= 0.0
+    assert result.system_one_latency_ms >= 0

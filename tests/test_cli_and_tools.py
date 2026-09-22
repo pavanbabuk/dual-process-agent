@@ -18,7 +18,11 @@ def test_cli_run_agent_task_execution(capsys):
     )
     captured = capsys.readouterr()
     assert "Dual-Process Agent Runtime" in captured.out
-    assert "Execution Telemetry & Benchmark" in captured.out
+    # Telemetry is labelled as measured; the old "& Benchmark" title implied a
+    # baseline comparison that this runner does not perform.
+    assert "Execution Telemetry (measured)" in captured.out
+    # The simulated run must say so rather than presenting stub latency as Jev.
+    assert "SIMULATED" in captured.out
 
 
 def test_builtin_mcp_tools(tmp_path):

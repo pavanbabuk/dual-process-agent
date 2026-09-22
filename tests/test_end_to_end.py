@@ -7,7 +7,16 @@ from dual_agent.mcp_host import MCPHost
 from bridges.hermes_middleware import HermesJevRoutingMiddleware
 
 
-def test_dual_process_speedup_and_token_savings():
+def test_dual_process_run_reports_measured_values_only():
+    """The runtime reports MEASURED values only.
+
+    This test previously asserted `estimated_token_savings_pct > 0`, which was
+    satisfied by multiplying the step count by a hardcoded 1500-token baseline —
+    it verified arithmetic on a constant, not any real saving. It now asserts the
+    opposite property: no invented baseline is reported, the run admits when its
+    router was simulated, and simulation latency is disclosed rather than passed
+    off as model latency.
+    """
     s1 = JevSystemOneClient(force_simulation=True)
     s2 = MockSystemTwoProvider()
     mcp = MCPHost()
@@ -24,12 +33,18 @@ def test_dual_process_speedup_and_token_savings():
         max_steps=6,
     )
 
-    # Verification criteria
     assert result.total_steps >= 1
-    # System 1 steps should have taken minimal latency (< 100ms each)
-    assert result.system_one_latency_ms < 500
-    # Verified token savings vs full LLM baseline
-    assert result.estimated_token_savings_pct > 0
+
+    # No fabricated benchmark fields exist any more.
+    assert not hasattr(result, "estimated_token_savings_pct")
+    assert not hasattr(result, "speedup_ratio")
+    assert not hasattr(result, "estimated_baseline_tokens")
+
+    # The run reports measured latency, and it tells the truth about simulation.
+    assert result.total_latency_ms > 0
+    assert result.used_simulated_system_one is True
+    assert result.system_one_fallback_reason == "force_simulation=True"
+    assert result.simulated_latency_ms > 0
 
 
 def test_hermes_middleware_intercept():

@@ -56,39 +56,45 @@ def run_agent_task(
     with console.status("[bold green]Running Dual-Process Agent Loop..."):
         result: DispatchResult = dispatcher.run(goal=goal, max_steps=max_steps)
 
-    # Telemetry Table
-    table = Table(title="Execution Telemetry & Benchmark", box=box.SIMPLE_HEAVY)
+    # Telemetry table — MEASURED VALUES ONLY.
+    # This table used to print a "Traditional LLM Baseline" column computed from
+    # hardcoded constants (1200ms / 1500 tokens per step) and an "Improvement"
+    # column derived from it. Those numbers were not measured, so they are gone.
+    table = Table(title="Execution Telemetry (measured)", box=box.SIMPLE_HEAVY)
     table.add_column("Metric", style="cyan", no_wrap=True)
-    table.add_column("Dual-Process (Jev + S2)", style="green")
-    table.add_column("Traditional LLM Baseline", style="red")
-    table.add_column("Improvement", style="bold yellow")
+    table.add_column("Value", style="green")
 
     table.add_row(
         "Total Steps",
         f"{result.total_steps} (S1: {result.system_one_steps}, S2: {result.system_two_steps})",
-        f"{result.total_steps} (All S2)",
-        "—"
     )
-    table.add_row(
-        "Total Latency",
-        f"{result.total_latency_ms:.1f} ms",
-        f"{result.total_steps * 1200:.1f} ms",
-        f"{result.speedup_ratio:.1f}x Faster"
-    )
-    table.add_row(
-        "System 1 Latency",
-        f"{result.system_one_latency_ms:.1f} ms",
-        "N/A",
-        "~15ms / step"
-    )
-    table.add_row(
-        "Tokens Consumed",
-        f"{result.tokens_used:,} tokens",
-        f"{result.estimated_baseline_tokens:,} tokens",
-        f"{result.estimated_token_savings_pct:.1f}% Saved"
-    )
+    table.add_row("Total Latency", f"{result.total_latency_ms:.1f} ms")
+    table.add_row("System 1 Latency", f"{result.system_one_latency_ms:.1f} ms")
+    table.add_row("System 2 Latency", f"{result.system_two_latency_ms:.1f} ms")
+    table.add_row("Tokens Consumed", f"{result.tokens_used:,} tokens")
 
     console.print(table)
+
+    if result.used_simulated_system_one:
+        console.print(
+            Panel(
+                "[bold yellow]⚠ System 1 is SIMULATED — these numbers do not measure Jev.[/bold yellow]\n"
+                f"Reason: {result.system_one_fallback_reason}\n"
+                f"Of the System 1 latency above, {result.simulated_latency_ms:.1f} ms is an emulated\n"
+                "network roundtrip inserted by the local stub, not model time.\n"
+                "Set TYPESAFE_API_KEY (and install typesafe-sdk) for real System 1 routing.",
+                border_style="yellow",
+                box=box.ROUNDED,
+            )
+        )
+
+    # A real savings/speedup figure requires running the same goal through a
+    # plain single-model agent loop and comparing. Not implemented yet, so we
+    # say so instead of printing an invented percentage.
+    console.print(
+        "[dim]Token-savings and speedup figures are omitted: no baseline run of this\n"
+        "goal against a plain-LLM agent was performed. Do not cite one without it.[/dim]"
+    )
 
     status_icon = "✅" if result.is_completed else "⚠️"
     console.print(f"\n{status_icon} [bold]Outcome:[/bold] {result.final_output or 'Task completed.'}\n")
@@ -111,6 +117,24 @@ def main():
     if sys.argv[1].lower() in ("update", "--update"):
         from dual_agent.updater import perform_update
         perform_update()
+        return
+
+    # If first argument is '--ui', launch the web dashboard
+    if sys.argv[1].lower() in ("ui", "--ui"):
+        port = 7860
+        no_browser = False
+        for arg in sys.argv[2:]:
+            if arg.startswith("--port="):
+                port = int(arg.split("=", 1)[1])
+            elif arg == "--no-browser":
+                no_browser = True
+            else:
+                try:
+                    port = int(arg)
+                except ValueError:
+                    pass
+        from dual_agent.web.server import run_server
+        run_server(host="localhost", port=port, open_browser=not no_browser)
         return
 
     parser = argparse.ArgumentParser(description="Run Dual-Process Agent with Jev and MCP.")

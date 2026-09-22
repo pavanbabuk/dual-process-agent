@@ -57,7 +57,10 @@ class MemoryEngine:
         """Create tables if they do not already exist."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            
+
+            # Enable WAL mode for better concurrent read performance
+            cursor.execute("PRAGMA journal_mode=WAL")
+
             # Sessions table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -74,6 +77,20 @@ class MemoryEngine:
                     token_savings_pct REAL,
                     steps_json TEXT
                 )
+            """)
+
+            # FTS5 virtual table for cross-session full-text search (Hermes-style recall)
+            cursor.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts
+                USING fts5(goal, outcome, content='sessions', content_rowid='id')
+            """)
+
+            # Trigger to keep FTS in sync with sessions inserts
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN
+                    INSERT INTO sessions_fts(rowid, goal, outcome)
+                    VALUES (new.id, new.goal, COALESCE(new.outcome, ''));
+                END
             """)
 
             # Learned skills table
@@ -98,6 +115,32 @@ class MemoryEngine:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            # Approval audit log (PermissionBroker decisions)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS approval_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tool_name TEXT NOT NULL,
+                    args_json TEXT,
+                    decision TEXT NOT NULL,
+                    decided_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Scheduled jobs (CronScheduler)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    description TEXT NOT NULL,
+                    cron_expr TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    enabled BOOLEAN DEFAULT 1,
+                    last_run_at TEXT,
+                    run_count INTEGER DEFAULT 0,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             conn.commit()
 
     def save_session(
@@ -110,10 +153,18 @@ class MemoryEngine:
         system_two_steps: int,
         total_latency_ms: float,
         tokens_used: int,
-        token_savings_pct: float,
+        token_savings_pct: Optional[float] = None,
         steps: Optional[List[Dict[str, Any]]] = None,
     ) -> int:
-        """Persist a completed task session into SQLite."""
+        """Persist a completed task session into SQLite.
+
+        `token_savings_pct` is intentionally optional: a savings percentage is
+        only meaningful when the same goal was also run through a baseline
+        (plain single-model) agent. When that comparison has not been performed
+        the honest stored value is NULL, not a modelled guess. Aggregates that
+        read this column return None rather than 0.0 so callers can tell
+        "not measured" apart from "measured zero".
+        """
         steps_str = json.dumps(steps or [])
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -253,7 +304,12 @@ class MemoryEngine:
                     "total_s1_steps": row["total_s1_steps"] or 0,
                     "total_s2_steps": row["total_s2_steps"] or 0,
                     "total_tokens": row["total_tokens"] or 0,
-                    "avg_token_savings_pct": round(row["avg_token_savings_pct"] or 0.0, 1),
+                    # None (not 0.0) when no session has a measured savings figure.
+                    "avg_token_savings_pct": (
+                        round(row["avg_token_savings_pct"], 1)
+                        if row["avg_token_savings_pct"] is not None
+                        else None
+                    ),
                 }
             return {
                 "total_sessions": 0,
@@ -261,5 +317,109 @@ class MemoryEngine:
                 "total_s1_steps": 0,
                 "total_s2_steps": 0,
                 "total_tokens": 0,
-                "avg_token_savings_pct": 0.0,
+                "avg_token_savings_pct": None,
             }
+
+    # ------------------------------------------------------------------
+    # FTS5 Full-Text Search (Hermes-style cross-session recall)
+    # ------------------------------------------------------------------
+
+    def full_text_search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Search past sessions by natural language query using SQLite FTS5.
+
+        Returns sessions ranked by relevance, most recent first when tied.
+        """
+        if not query.strip():
+            return []
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT s.id, s.created_at, s.goal, s.outcome, s.is_completed,
+                           s.total_steps, s.tokens_used
+                    FROM sessions_fts
+                    JOIN sessions s ON sessions_fts.rowid = s.id
+                    WHERE sessions_fts MATCH ?
+                    ORDER BY rank, s.id DESC
+                    LIMIT ?
+                    """,
+                    (query, limit),
+                )
+                return [dict(r) for r in cursor.fetchall()]
+        except Exception as e:
+            logger.warning(f"[Memory] FTS search failed: {e}. Falling back to LIKE search.")
+            return self._fallback_search(query, limit)
+
+    def _fallback_search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """LIKE-based search fallback if FTS5 is unavailable."""
+        terms = [f"%{t}%" for t in query.split()[:3]]
+        if not terms:
+            return []
+        where = " OR ".join("goal LIKE ?" for _ in terms)
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT id, created_at, goal, outcome, is_completed, total_steps, tokens_used "
+                f"FROM sessions WHERE {where} ORDER BY id DESC LIMIT ?",
+                (*terms, limit),
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def build_recall_context(self, query: str, limit: int = 3) -> str:
+        """Build a formatted recall context block for System 2 prompt injection."""
+        matches = self.full_text_search(query, limit=limit)
+        if not matches:
+            return ""
+        lines = ["[RELEVANT PAST SESSIONS]"]
+        for m in matches:
+            status = "✅" if m.get("is_completed") else "⚠️"
+            lines.append(
+                f"\n{status} [{m['created_at'][:10]}] Goal: {m['goal'][:100]}\n"
+                f"   Outcome: {(m.get('outcome') or 'N/A')[:120]}"
+            )
+        lines.append("\n[END PAST SESSIONS]\n")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # USER.md — Hermes-style persistent user profile
+    # ------------------------------------------------------------------
+
+    def _user_profile_path(self) -> str:
+        data_dir = os.path.dirname(self.db_path)
+        return os.path.join(data_dir, "USER.md")
+
+    def get_user_profile(self) -> str:
+        """Read the USER.md file content. Returns empty string if not found."""
+        path = self._user_profile_path()
+        if not os.path.exists(path):
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            logger.warning(f"[Memory] Could not read USER.md: {e}")
+            return ""
+
+    def update_user_profile(self, fact: str) -> None:
+        """Append a learned fact about the user to USER.md.
+
+        Facts are bullet points added to a dated section, just like Hermes does
+        with its USER.md maintained across sessions.
+        """
+        if not fact or not fact.strip():
+            return
+        path = self._user_profile_path()
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        fact_line = f"- [{now}] {fact.strip()}\n"
+
+        if not os.path.exists(path):
+            header = "# User Profile\n\nAuto-maintained by Dual-Process Agent.\n\n## Learned Facts\n\n"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(header + fact_line)
+        else:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(fact_line)
+
+        logger.debug(f"[Memory] USER.md updated: {fact_line.strip()}")
+

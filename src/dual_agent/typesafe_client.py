@@ -27,6 +27,11 @@ class JevDecision(BaseModel):
     evaluation_score: Optional[int] = None
     latency_ms: float = 0.0
     simulated: bool = False
+    # Set whenever this decision did NOT come from the live Jev model — i.e. the
+    # router ran a local heuristic, either because no credentials were present or
+    # because a live call failed. Callers must surface this; a simulated decision
+    # is not a Jev decision.
+    fallback_reason: Optional[str] = None
 
 
 class JevSystemOneClient:
@@ -46,10 +51,22 @@ class JevSystemOneClient:
         self.api_key = api_key or os.getenv("TYPESAFE_API_KEY")
         self.base_url = base_url or os.getenv("TYPESAFE_BASE_URL", "https://api.typesafe.ai")
         self.timeout = timeout
-        self.force_simulation = force_simulation or not bool(self.api_key)
-        
+
+        # Why we are (or are not) talking to the live Jev model. This reason is
+        # attached to every JevDecision so simulated routing can never be
+        # silently reported as a real model call.
+        self.simulation_reason: str = ""
+        if force_simulation:
+            self.simulation_reason = "force_simulation=True"
+        elif not self.api_key:
+            self.simulation_reason = "TYPESAFE_API_KEY is not set"
+        elif not HAS_TYPESAFE_SDK:
+            self.simulation_reason = "typesafe-sdk is not installed"
+
+        self.force_simulation = bool(self.simulation_reason)
         self._sdk_client: Optional[Any] = None
-        if not self.force_simulation and HAS_TYPESAFE_SDK:
+
+        if not self.force_simulation:
             try:
                 self._sdk_client = TypeSafeClient(
                     api_key=self.api_key,
@@ -61,8 +78,7 @@ class JevSystemOneClient:
             except Exception as e:
                 logger.warning(f"Failed to initialize TypeSafeClient ({e}). Falling back to simulation mode.")
                 self.force_simulation = True
-        else:
-            self.force_simulation = True
+                self.simulation_reason = f"TypeSafeClient init failed: {type(e).__name__}: {e}"
 
     def evaluate_state_and_route(
         self,
@@ -142,6 +158,7 @@ class JevSystemOneClient:
         except Exception as e:
             logger.warning(f"Live Jev API failed ({type(e).__name__}: {e}). Gracefully falling back to simulation mode.")
             self.force_simulation = True
+            self.simulation_reason = f"live call failed: {type(e).__name__}: {e}"
             return self._call_simulated_jev(state_text, choices, start_time)
 
     def _call_simulated_jev(
@@ -150,8 +167,16 @@ class JevSystemOneClient:
         choices: Dict[str, str],
         start_time: float,
     ) -> JevDecision:
-        """Fast, calibrated simulation of Jev System 1 behavior (typically ~10-15ms)."""
-        time.sleep(0.012)  # Simulate typical Jev 12ms network roundtrip
+        """Local heuristic router used when the live Jev model is unavailable.
+
+        IMPORTANT: this is a deterministic keyword-matching stub, NOT the Jev
+        model. It sleeps ~12ms purely to emulate a network roundtrip so that
+        local benchmarking has a realistic latency profile — the sleep is a
+        simulation artifact and must never be reported as model latency.
+        Every decision it returns carries `simulated=True` and a
+        `fallback_reason` explaining why the live model was not used.
+        """
+        time.sleep(0.012)  # Simulation artifact: emulates a Jev roundtrip. Not real latency.
         elapsed_ms = (time.perf_counter() - start_time) * 1000
 
         state_lower = state_text.lower()
@@ -195,6 +220,7 @@ class JevSystemOneClient:
             needs_generation=needs_gen,
             latency_ms=elapsed_ms,
             simulated=True,
+            fallback_reason=self.simulation_reason or "simulation mode",
         )
 
     def evaluate_output_score(self, output_text: str, rubric: str) -> int:
@@ -216,6 +242,7 @@ class JevSystemOneClient:
             except Exception as e:
                 logger.warning(f"Error scoring with Jev: {e}. Defaulting to 4.")
                 return 4
-        
+
+        # Offline heuristic: length-based, not a real quality judgement.
         time.sleep(0.008)
         return 5 if len(output_text.strip()) > 10 else 2

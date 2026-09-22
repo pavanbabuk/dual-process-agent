@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import os
+import shlex
 import subprocess
 import time
 import json
@@ -19,6 +20,16 @@ class MCPToolDefinition(BaseModel):
     parameters_schema: Dict[str, Any] = Field(default_factory=dict)
     handler: Optional[Callable[[Dict[str, Any]], Any]] = None
     is_safe: bool = True
+    # Permission broker fields (OpenMausBot-style approval gating)
+    requires_approval: bool = False
+    risk_level: str = "low"  # "low", "medium", "high"
+    # Declared interface, used by the fast-path argument validator and surfaced on
+    # the approval card. `requirements` states why the tool may ask for input,
+    # so an approval is granted against a stated purpose rather than vibes.
+    arguments: List[str] = Field(default_factory=list)
+    requirements: List[str] = Field(default_factory=list)
+    requires_user_input: bool = False
+    accepts_user_input: bool = False
 
 
 class ToolExecutionResult(BaseModel):
@@ -170,22 +181,40 @@ class MCPHost:
                     "required": ["path", "content"],
                 },
                 handler=_write_file,
+                requires_approval=True,
+                risk_level="medium",
             )
         )
 
         # 4. run_shell_command
         def _run_cmd(args: Dict[str, Any]) -> str:
             command = args.get("command", "")
+            if not command:
+                return "Error: No command provided — refusing to execute an empty command."
+            # SECURITY: no shell. `shell=True` on a command assembled from model
+            # output plus a string-interpolated argument turns any quoting mistake
+            # into command injection (e.g. path='"; rm -rf ~ #'). argv form also
+            # means the permission card shows the real executable, so approving
+            # "ls -la" cannot actually run something else.
+            try:
+                argv = shlex.split(command)
+            except ValueError as e:
+                return f"Error: could not parse command ({e}). Use simple argv-style commands."
+            if not argv:
+                return "Error: No command provided — refusing to execute an empty command."
+
             try:
                 proc = subprocess.run(
-                    command,
-                    shell=True,
+                    argv,
+                    shell=False,
                     capture_output=True,
                     text=True,
                     timeout=15,
                 )
                 output = proc.stdout if proc.returncode == 0 else proc.stderr
                 return f"ExitCode: {proc.returncode}\nOutput:\n{output.strip()[:2000]}"
+            except FileNotFoundError as e:
+                return f"Error: command not found: {e}"
             except subprocess.TimeoutExpired:
                 return "Error: Command timed out after 15 seconds."
             except Exception as e:
@@ -194,12 +223,27 @@ class MCPHost:
         self.register_tool(
             MCPToolDefinition(
                 name="run_shell_command",
-                description="Execute a bash/shell command in the local environment and return stdout/stderr.",
+                description=(
+                    "Execute a shell command in the local environment and return stdout/stderr. "
+                    "Arguments are passed as argv (no shell), so pipes, redirects, globbing and "
+                    "$$VAR expansion are not available — call the target binary directly."
+                ),
+                # The card shows argv; requirements state why arguments were accepted.
+                requires_user_input=True,
+                accepts_user_input=True,
                 parameters_schema={
                     "type": "object",
                     "properties": {"command": {"type": "string", "description": "Shell command to execute"}},
                     "required": ["command"],
                 },
                 handler=_run_cmd,
+                requires_approval=True,
+                risk_level="high",
+                arguments=["command"],
+                requirements=[
+                    "run_shell_command executes with the agent's own privileges; "
+                    "only commands needed for this task may be requested.",
+                    "The agent must not request commands that delete, overwrite, or exfiltrate data.",
+                ],
             )
         )

@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dual-Process Agent Dashboard</title>
+  <style>
+    /* ── CSS Variables ─────────────────────────────────────────────────── */
+    :root[data-theme="dark"] {
+      --bg-base:     #0d1117;
+      --bg-surface:  #161b22;
+      --bg-hover:    #21262d;
+      --bg-input:    #0d1117;
+      --border:      #30363d;
+      --text-primary:#e6edf3;
+      --text-dim:    #7d8590;
+      --text-muted:  #484f58;
+      --accent:      #58a6ff;
+      --accent-dim:  #1f3a5f;
+      --green:       #3fb950;
+      --green-dim:   #0f2d13;
+      --yellow:      #d29922;
+      --yellow-dim:  #2d2100;
+      --red:         #f85149;
+      --red-dim:     #3d0d09;
+      --purple:      #bc8cff;
+      --purple-dim:  #2d1e5a;
+      --s1-color:    #58a6ff;
+      --s2-color:    #bc8cff;
+      --done-color:  #3fb950;
+    }
+    :root[data-theme="light"] {
+      --bg-base:     #ffffff;
+      --bg-surface:  #f6f8fa;
+      --bg-hover:    #eaeef2;
+      --bg-input:    #ffffff;
+      --border:      #d0d7de;
+      --text-primary:#1f2328;
+      --text-dim:    #656d76;
+      --text-muted:  #9198a1;
+      --accent:      #0969da;
+      --accent-dim:  #ddf4ff;
+      --green:       #1a7f37;
+      --green-dim:   #dafbe1;
+      --yellow:      #9a6700;
+      --yellow-dim:  #fff8c5;
+      --red:         #cf222e;
+      --red-dim:     #ffebe9;
+      --purple:      #8250df;
+      --purple-dim:  #fbefff;
+      --s1-color:    #0969da;
+      --s2-color:    #8250df;
+      --done-color:  #1a7f37;
+    }
+
+    /* ── Reset & Base ───────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%; overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      background: var(--bg-base);
+      color: var(--text-primary);
+    }
+
+    /* ── Layout ─────────────────────────────────────────────────────────── */
+    .app {
+      display: grid;
+      grid-template-rows: 52px 1fr;
+      grid-template-columns: 260px 1fr;
+      height: 100vh;
+    }
+    .topbar {
+      grid-column: 1 / -1;
+      display: flex; align-items: center; gap: 12px;
+      padding: 0 16px;
+      background: var(--bg-surface);
+      border-bottom: 1px solid var(--border);
+      z-index: 10;
+    }
+    .sidebar {
+      background: var(--bg-surface);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      display: flex; flex-direction: column;
+    }
+    .main {
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Topbar ─────────────────────────────────────────────────────────── */
+    .logo { font-weight: 700; font-size: 15px; color: var(--accent); letter-spacing: -0.3px; }
+    .logo span { color: var(--text-dim); font-weight: 400; }
+    .topbar-meta { color: var(--text-dim); font-size: 12px; margin-left: auto; display: flex; gap: 16px; align-items: center; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600;
+    }
+    .badge-green { background: var(--green-dim); color: var(--green); }
+    .badge-blue  { background: var(--accent-dim); color: var(--accent); }
+    .badge-purple{ background: var(--purple-dim); color: var(--purple); }
+    .badge-red   { background: var(--red-dim); color: var(--red); }
+    .badge-yellow{ background: var(--yellow-dim); color: var(--yellow); }
+    .ws-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--red); transition: background .3s;
+    }
+    .ws-dot.connected { background: var(--green); }
+
+    /* ── Sidebar Sections ───────────────────────────────────────────────── */
+    .sidebar-section { padding: 12px 0; border-bottom: 1px solid var(--border); }
+    .sidebar-title {
+      font-size: 11px; font-weight: 700; letter-spacing: .08em;
+      text-transform: uppercase; color: var(--text-muted);
+      padding: 0 16px 8px;
+    }
+    .sidebar-item {
+      display: flex; align-items: flex-start; gap: 8px;
+      padding: 5px 16px; cursor: default; border-radius: 0;
+      transition: background .1s;
+    }
+    .sidebar-item:hover { background: var(--bg-hover); }
+    .sidebar-item .item-icon { font-size: 13px; flex-shrink: 0; margin-top: 1px; }
+    .sidebar-item .item-name { font-size: 12px; color: var(--text-primary); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sidebar-item .item-sub  { font-size: 11px; color: var(--text-dim); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sidebar-count {
+      margin-left: auto; font-size: 11px; font-weight: 600;
+      color: var(--text-muted); flex-shrink: 0;
+    }
+    .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 0 16px 4px; }
+    .stat-box {
+      background: var(--bg-base); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px;
+    }
+    .stat-val { font-size: 18px; font-weight: 700; color: var(--accent); }
+    .stat-lbl { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
+
+    /* ── Main panel ─────────────────────────────────────────────────────── */
+    .messages {
+      flex: 1; overflow-y: auto; padding: 20px 24px;
+      display: flex; flex-direction: column; gap: 12px;
+    }
+
+    /* ── Message bubbles ────────────────────────────────────────────────── */
+    .msg { display: flex; flex-direction: column; max-width: 860px; width: 100%; }
+    .msg-meta { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; display: flex; gap: 8px; align-items: center; }
+    .msg-bubble {
+      background: var(--bg-surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 12px 16px;
+      font-size: 13px; line-height: 1.55;
+    }
+    .msg-user .msg-bubble {
+      background: var(--accent-dim); border-color: var(--accent);
+      align-self: flex-end; color: var(--text-primary);
+    }
+    .msg-user { align-items: flex-end; }
+
+    /* ── Step trace ─────────────────────────────────────────────────────── */
+    .trace-block {
+      border: 1px solid var(--border); border-radius: 8px;
+      overflow: hidden; font-size: 12px;
+    }
+    .trace-header {
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 12px;
+      background: var(--bg-hover); border-bottom: 1px solid var(--border);
+      font-weight: 600; font-size: 11px; color: var(--text-dim);
+    }
+    .step-row {
+      display: grid; grid-template-columns: 36px 80px 120px 1fr 70px 60px;
+      align-items: start; padding: 7px 12px; border-bottom: 1px solid var(--border);
+      gap: 8px; transition: background .1s;
+    }
+    .step-row:last-child { border-bottom: none; }
+    .step-row:hover { background: var(--bg-hover); }
+    .step-num { color: var(--text-muted); font-size: 11px; font-weight: 600; }
+    .step-path-s1 { color: var(--s1-color); font-weight: 600; }
+    .step-path-s2 { color: var(--s2-color); font-weight: 600; }
+    .step-path-term { color: var(--done-color); font-weight: 600; }
+    .step-action { font-family: "SFMono-Regular", Consolas, monospace; color: var(--text-primary); }
+    .step-output { color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
+    .step-latency { color: var(--text-muted); font-size: 11px; text-align: right; }
+    .step-tokens  { color: var(--text-muted); font-size: 11px; text-align: right; }
+
+    /* ── Done card ──────────────────────────────────────────────────────── */
+    .done-card {
+      background: var(--green-dim); border: 1px solid var(--green);
+      border-radius: 8px; padding: 12px 16px;
+    }
+    .done-card .done-title { font-weight: 700; color: var(--green); font-size: 14px; margin-bottom: 6px; }
+    .done-card .done-output { color: var(--text-primary); font-size: 13px; margin-bottom: 10px; line-height: 1.5; }
+    .done-stats { display: flex; flex-wrap: wrap; gap: 12px; font-size: 11px; color: var(--text-dim); }
+    .done-stats span b { color: var(--text-primary); }
+
+    /* ── Permission card ────────────────────────────────────────────────── */
+    .perm-card {
+      border: 2px solid var(--yellow); border-radius: 10px;
+      background: var(--yellow-dim); padding: 14px 16px;
+    }
+    .perm-card[data-risk="high"]   { border-color: var(--red);    background: var(--red-dim); }
+    .perm-card[data-risk="medium"] { border-color: var(--yellow);  background: var(--yellow-dim); }
+    .perm-card[data-risk="low"]    { border-color: var(--green);   background: var(--green-dim); }
+    .perm-title { font-weight: 700; font-size: 13px; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+    .perm-title[data-risk="high"]   { color: var(--red); }
+    .perm-title[data-risk="medium"] { color: var(--yellow); }
+    .perm-title[data-risk="low"]    { color: var(--green); }
+    .perm-detail { font-size: 12px; color: var(--text-dim); margin-bottom: 10px; }
+    .perm-detail code {
+      background: var(--bg-base); border: 1px solid var(--border);
+      border-radius: 4px; padding: 2px 6px;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      color: var(--text-primary); font-size: 12px;
+    }
+    .perm-args {
+      background: var(--bg-base); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 10px; margin-bottom: 10px;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 11px; color: var(--text-primary);
+      white-space: pre; overflow-x: auto;
+    }
+    .perm-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 6px 14px; border-radius: 6px; border: 1px solid transparent;
+      font-size: 12px; font-weight: 600; cursor: pointer; transition: opacity .15s;
+      font-family: inherit;
+    }
+    .btn:hover { opacity: .85; }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-green  { background: var(--green);  color: #fff; border-color: var(--green); }
+    .btn-red    { background: var(--red);    color: #fff; border-color: var(--red); }
+    .btn-yellow { background: var(--yellow); color: #fff; border-color: var(--yellow); }
+    .btn-blue   { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .btn-ghost  { background: transparent; color: var(--text-dim); border-color: var(--border); }
+
+    /* ── Edit args inline ───────────────────────────────────────────────── */
+    .edit-area {
+      width: 100%; margin-top: 8px;
+      background: var(--bg-base); border: 1px solid var(--accent);
+      border-radius: 6px; padding: 8px; color: var(--text-primary);
+      font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px;
+      resize: vertical; min-height: 72px;
+    }
+
+    /* ── Input bar ──────────────────────────────────────────────────────── */
+    .input-bar {
+      padding: 12px 24px; background: var(--bg-surface);
+      border-top: 1px solid var(--border);
+      display: flex; gap: 8px; align-items: flex-end;
+    }
+    .goal-input {
+      flex: 1; background: var(--bg-input); border: 1px solid var(--border);
+      border-radius: 8px; padding: 10px 14px; color: var(--text-primary);
+      font-size: 14px; font-family: inherit; resize: none; max-height: 120px;
+      outline: none; transition: border-color .2s; line-height: 1.4;
+    }
+    .goal-input:focus { border-color: var(--accent); }
+    .goal-input::placeholder { color: var(--text-muted); }
+    .run-btn {
+      padding: 10px 20px; border-radius: 8px; border: none;
+      background: var(--accent); color: #fff;
+      font-size: 14px; font-weight: 600; cursor: pointer;
+      font-family: inherit; transition: opacity .15s; white-space: nowrap;
+    }
+    .run-btn:disabled { opacity: .4; cursor: not-allowed; }
+    .run-btn:hover:not(:disabled) { opacity: .88; }
+    .stop-btn {
+      padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg-hover); color: var(--text-dim);
+      font-size: 13px; cursor: pointer; font-family: inherit;
+      transition: opacity .15s; display: none;
+    }
+    .stop-btn.visible { display: block; }
+
+    /* ── Theme toggle ───────────────────────────────────────────────────── */
+    .theme-btn {
+      background: none; border: 1px solid var(--border); border-radius: 6px;
+      color: var(--text-dim); padding: 4px 8px; cursor: pointer; font-size: 13px;
+    }
+    .theme-btn:hover { background: var(--bg-hover); }
+
+    /* ── Typing indicator ───────────────────────────────────────────────── */
+    .typing-dots { display: flex; gap: 4px; align-items: center; padding: 4px 0; }
+    .typing-dots span {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--text-muted);
+      animation: bounce .8s infinite;
+    }
+    .typing-dots span:nth-child(2) { animation-delay: .15s; }
+    .typing-dots span:nth-child(3) { animation-delay: .3s; }
+    @keyframes bounce { 0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-5px)} }
+
+    /* ── Scrollbar ──────────────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── Error toast ────────────────────────────────────────────────────── */
+    .toast {
+      position: fixed; bottom: 80px; right: 24px;
+      background: var(--red-dim); border: 1px solid var(--red);
+      color: var(--red); padding: 10px 16px; border-radius: 8px;
+      font-size: 13px; z-index: 999; opacity: 0;
+      transition: opacity .3s; pointer-events: none;
+    }
+    .toast.show { opacity: 1; }
+
+    /* ── Empty state ────────────────────────────────────────────────────── */
+    .empty-state {
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      height: 100%; color: var(--text-muted); gap: 8px; text-align: center;
+    }
+    .empty-state .empty-icon { font-size: 40px; }
+    .empty-state .empty-title { font-size: 16px; font-weight: 600; color: var(--text-dim); }
+    .empty-state .empty-sub { font-size: 13px; max-width: 360px; line-height: 1.5; }
+    .example-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; justify-content: center; }
+    .chip {
+      background: var(--bg-surface); border: 1px solid var(--border);
+      border-radius: 20px; padding: 5px 12px; font-size: 12px;
+      color: var(--text-dim); cursor: pointer; transition: all .15s;
+    }
+    .chip:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+
+    /* ── Responsive ─────────────────────────────────────────────────────── */
+    @media (max-width: 700px) {
+      .app { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ── Topbar ─────────────────────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="logo">⚡ Dual-Process <span>Agent</span></div>
+    <span class="badge badge-blue" id="badge-provider">{{ provider }}</span>
+    <span class="badge badge-green" id="badge-tools">{{ tool_count }} tools</span>
+    <div class="topbar-meta">
+      <span id="ws-label" style="font-size:11px;color:var(--text-muted);">Disconnected</span>
+      <div class="ws-dot" id="ws-dot"></div>
+      <button class="theme-btn" onclick="toggleTheme()" title="Toggle theme">🌓</button>
+    </div>
+  </header>
+
+  <!-- ── Sidebar ─────────────────────────────────────────────────────────── -->
+  <aside class="sidebar">
+
+    <!-- Stats -->
+    <div class="sidebar-section">
+      <div class="sidebar-title">Session Stats</div>
+      <div class="stat-grid">
+        <div class="stat-box"><div class="stat-val" id="stat-sessions">—</div><div class="stat-lbl">Sessions</div></div>
+        <div class="stat-box"><div class="stat-val" id="stat-savings">—</div><div class="stat-lbl">Token Savings</div></div>
+        <div class="stat-box"><div class="stat-val" id="stat-s1">—</div><div class="stat-lbl">S1 Fast Steps</div></div>
+        <div class="stat-box"><div class="stat-val" id="stat-s2">—</div><div class="stat-lbl">S2 Slow Steps</div></div>
+      </div>
+    </div>
+
+    <!-- Skills -->
+    <div class="sidebar-section" style="flex:1;min-height:0;">
+      <div class="sidebar-title">Synthesized Skills</div>
+      <div id="skills-list">
+        <div style="padding:8px 16px;color:var(--text-muted);font-size:12px;">Loading…</div>
+      </div>
+    </div>
+
+    <!-- Schedules -->
+    <div class="sidebar-section">
+      <div class="sidebar-title">Scheduled Jobs</div>
+      <div id="schedules-list">
+        <div style="padding:8px 16px;color:var(--text-muted);font-size:12px;">Loading…</div>
+      </div>
+    </div>
+
+    <!-- Tools -->
+    <div class="sidebar-section">
+      <div class="sidebar-title">MCP Tools</div>
+      <div id="tools-list">
+        <div style="padding:8px 16px;color:var(--text-muted);font-size:12px;">Loading…</div>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ── Main ────────────────────────────────────────────────────────────── -->
+  <main class="main">
+
+    <div class="messages" id="messages">
+      <!-- Empty state -->
+      <div class="empty-state" id="empty-state">
+        <div class="empty-icon">🤖</div>
+        <div class="empty-title">Dual-Process Agent</div>
+        <div class="empty-sub">
+          Type a goal below to start. System 1 (Jev) handles fast tool routing,
+          System 2 handles reasoning. You'll see every step in real time.
+        </div>
+        <div class="example-chips" id="chips">
+          <div class="chip" onclick="setGoal(this)">Inspect pyproject.toml and list dependencies</div>
+          <div class="chip" onclick="setGoal(this)">List files in the current directory</div>
+          <div class="chip" onclick="setGoal(this)">Read the README.md file</div>
+          <div class="chip" onclick="setGoal(this)">Run a quick git status</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Input bar -->
+    <div class="input-bar">
+      <textarea
+        id="goal-input"
+        class="goal-input"
+        rows="1"
+        placeholder="Type your goal or /help for commands…"
+        onkeydown="handleKey(event)"
+        oninput="autoResize(this)"
+      ></textarea>
+      <button class="stop-btn" id="stop-btn" onclick="stopRun()">⏹ Stop</button>
+      <button class="run-btn" id="run-btn" onclick="sendGoal()">▶ Run</button>
+    </div>
+
+  </main>
+</div>
+
+<!-- Error toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+/* ── State ──────────────────────────────────────────────────────────────── */
+let ws = null;
+let isRunning = false;
+let currentTraceBlock = null;
+let currentTraceBody = null;
+
+/* ── WebSocket ──────────────────────────────────────────────────────────── */
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    setWsState(true);
+    loadSidebar();
+  };
+
+  ws.onclose = () => {
+    setWsState(false);
+    setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => setWsState(false);
+
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    handleEvent(msg);
+  };
+}
+
+function setWsState(connected) {
+  document.getElementById('ws-dot').classList.toggle('connected', connected);
+  document.getElementById('ws-label').textContent = connected ? 'Connected' : 'Reconnecting…';
+}
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+/* ── Event handler ──────────────────────────────────────────────────────── */
+function handleEvent(msg) {
+  switch (msg.type) {
+    case 'init':
+      document.getElementById('badge-provider').textContent = msg.provider;
+      document.getElementById('badge-tools').textContent = `${msg.tool_count} tools`;
+      break;
+
+    case 'started':
+      hideEmpty();
+      appendUserMsg(msg.goal);
+      currentTraceBlock = createTraceBlock();
+      setRunning(true);
+      break;
+
+    case 'step':
+      appendStep(msg);
+      break;
+
+    case 'permission':
+      appendPermissionCard(msg);
+      break;
+
+    case 'done':
+      finishRun(msg);
+      break;
+
+    case 'error':
+      showToast('⚠ ' + msg.message);
+      setRunning(false);
+      break;
+
+    case 'pong': break;
+  }
+}
+
+/* ── UI helpers ─────────────────────────────────────────────────────────── */
+function hideEmpty() {
+  const el = document.getElementById('empty-state');
+  if (el) el.remove();
+}
+
+function scrollBottom() {
+  const m = document.getElementById('messages');
+  m.scrollTop = m.scrollHeight;
+}
+
+function appendUserMsg(text) {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg msg-user';
+  div.innerHTML = `
+    <div class="msg-meta">You</div>
+    <div class="msg-bubble">${escHtml(text)}</div>
+  `;
+  msgs.appendChild(div);
+  scrollBottom();
+}
+
+function createTraceBlock() {
+  const msgs = document.getElementById('messages');
+  const wrap = document.createElement('div');
+  wrap.className = 'msg';
+  wrap.innerHTML = `
+    <div class="msg-meta">🤖 Agent <span class="badge badge-blue" style="margin-left:4px">running</span></div>
+    <div class="trace-block">
+      <div class="trace-header">
+        <span style="color:var(--s1-color)">⚡ S1</span> Fast-path &nbsp;·&nbsp;
+        <span style="color:var(--s2-color)">🧠 S2</span> Slow-path &nbsp;·&nbsp;
+        <span style="color:var(--done-color)">✓</span> Terminal
+      </div>
+      <div class="trace-body" style="min-height:36px;"></div>
+    </div>
+  `;
+  msgs.appendChild(wrap);
+  currentTraceBody = wrap.querySelector('.trace-body');
+  // Add typing indicator
+  currentTraceBody.innerHTML = `<div style="padding:8px 12px"><div class="typing-dots"><span></span><span></span><span></span></div></div>`;
+  scrollBottom();
+  return wrap;
+}
+
+function appendStep(msg) {
+  if (!currentTraceBody) return;
+  // Remove typing dots
+  const dots = currentTraceBody.querySelector('.typing-dots');
+  if (dots) dots.parentElement.remove();
+
+  const pathClass = {
+    'S1_FAST':  'step-path-s1',
+    'S2_SLOW':  'step-path-s2',
+    'TERMINAL': 'step-path-term',
+  }[msg.path] || 'step-path-s1';
+
+  const pathLabel = {
+    'S1_FAST':  '⚡ S1',
+    'S2_SLOW':  '🧠 S2',
+    'TERMINAL': '✓ End',
+  }[msg.path] || msg.path;
+
+  const row = document.createElement('div');
+  row.className = 'step-row';
+  row.innerHTML = `
+    <div class="step-num">#${msg.step}</div>
+    <div class="${pathClass}">${pathLabel}</div>
+    <div class="step-action">${escHtml(msg.action)}</div>
+    <div class="step-output">${escHtml(String(msg.output || '').slice(0, 300))}</div>
+    <div class="step-latency">${msg.latency_ms}ms</div>
+    <div class="step-tokens">${msg.tokens_used > 0 ? msg.tokens_used + 'tk' : '—'}</div>
+  `;
+  currentTraceBody.appendChild(row);
+  scrollBottom();
+}
+
+function appendPermissionCard(msg) {
+  const msgs = document.getElementById('messages');
+  const risk = msg.risk || 'high';
+  const riskIcon = { high: '🔴', medium: '🟡', low: '🟢' }[risk] || '🔐';
+  const argsStr = JSON.stringify(msg.args || {}, null, 2);
+
+  const div = document.createElement('div');
+  div.className = 'msg';
+  div.dataset.requestId = msg.request_id;
+  div.innerHTML = `
+    <div class="msg-meta">🔐 Permission Required</div>
+    <div class="perm-card" data-risk="${escHtml(risk)}">
+      <div class="perm-title" data-risk="${escHtml(risk)}">
+        ${riskIcon} ${escHtml(msg.tool)} &mdash; <span style="text-transform:uppercase;font-size:11px">${escHtml(risk)} risk</span>
+      </div>
+      <div class="perm-detail">Tool: <code>${escHtml(msg.tool)}</code></div>
+      <div class="perm-args">${escHtml(argsStr)}</div>
+      <textarea id="edit-${msg.request_id}" class="edit-area" style="display:none">${escHtml(argsStr)}</textarea>
+      <div class="perm-btns">
+        <button class="btn btn-green"  onclick="permDecide('${msg.request_id}','allow_once')">✅ Allow Once</button>
+        <button class="btn btn-blue"   onclick="permDecide('${msg.request_id}','allow_session')">🔓 Allow Session</button>
+        <button class="btn btn-red"    onclick="permDecide('${msg.request_id}','deny')">🚫 Deny</button>
+        <button class="btn btn-yellow" onclick="toggleEdit('${msg.request_id}')">✏️ Edit</button>
+        <button class="btn btn-ghost"  onclick="permDecideEdited('${msg.request_id}')" id="save-${msg.request_id}" style="display:none">💾 Send Edited</button>
+      </div>
+    </div>
+  `;
+  msgs.appendChild(div);
+  scrollBottom();
+}
+
+function permDecide(requestId, decision) {
+  send({ type: 'permission_response', request_id: requestId, decision });
+  const card = document.querySelector(`[data-request-id="${requestId}"]`);
+  if (card) {
+    const labels = { allow_once: '✅ Allowed Once', allow_session: '🔓 Allowed (Session)', deny: '🚫 Denied' };
+    card.querySelector('.perm-card').style.opacity = '0.5';
+    card.querySelector('.perm-btns').innerHTML = `<span style="color:var(--text-dim);font-size:12px">${labels[decision] || decision}</span>`;
+  }
+}
+
+function toggleEdit(requestId) {
+  const ta = document.getElementById(`edit-${requestId}`);
+  const btn = document.getElementById(`save-${requestId}`);
+  if (ta.style.display === 'none') {
+    ta.style.display = 'block'; btn.style.display = 'inline-flex';
+  } else {
+    ta.style.display = 'none'; btn.style.display = 'none';
+  }
+}
+
+function permDecideEdited(requestId) {
+  const ta = document.getElementById(`edit-${requestId}`);
+  let editedArgs = {};
+  try { editedArgs = JSON.parse(ta.value); } catch { showToast('Invalid JSON'); return; }
+  send({ type: 'permission_response', request_id: requestId, decision: 'edited', edited_args: editedArgs });
+  const card = document.querySelector(`[data-request-id="${requestId}"]`);
+  if (card) {
+    card.querySelector('.perm-card').style.opacity = '0.5';
+    card.querySelector('.perm-btns').innerHTML = `<span style="color:var(--text-dim);font-size:12px">✏️ Sent with edited args</span>`;
+  }
+}
+
+function finishRun(msg) {
+  // Update trace block header
+  if (currentTraceBlock) {
+    const badge = currentTraceBlock.querySelector('.badge');
+    if (badge) {
+      badge.textContent = msg.is_completed ? 'done' : 'incomplete';
+      badge.className = `badge ${msg.is_completed ? 'badge-green' : 'badge-yellow'}`;
+    }
+  }
+
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg';
+  div.innerHTML = `
+    <div class="msg-meta">✅ Completed</div>
+    <div class="done-card">
+      <div class="done-title">${msg.is_completed ? '✅ Task Completed' : '⚠️ Partially Completed'}</div>
+      <div class="done-output">${escHtml(msg.final_output || 'Done.')}</div>
+      <div class="done-stats">
+        <span>Steps: <b>${msg.total_steps}</b></span>
+        <span>S1: <b>${msg.system_one_steps}</b></span>
+        <span>S2: <b>${msg.system_two_steps}</b></span>
+        <span>Latency: <b>${msg.total_latency_ms}ms</b></span>
+        <span>Tokens: <b>${msg.tokens_used}</b></span>
+        <span>Savings: <b style="color:var(--green)">${msg.token_savings_pct}%</b></span>
+        <span>Speedup: <b style="color:var(--accent)">${msg.speedup_ratio}x</b></span>
+      </div>
+    </div>
+  `;
+  msgs.appendChild(div);
+  setRunning(false);
+  scrollBottom();
+  loadSidebar(); // refresh sidebar stats
+  currentTraceBlock = null;
+  currentTraceBody = null;
+}
+
+/* ── Input handling ─────────────────────────────────────────────────────── */
+function sendGoal() {
+  if (isRunning) return;
+  const inp = document.getElementById('goal-input');
+  const goal = inp.value.trim();
+  if (!goal) return;
+  inp.value = '';
+  inp.style.height = 'auto';
+  send({ type: 'run', goal });
+}
+
+function stopRun() {
+  // Best effort — the dispatcher will finish its current step
+  setRunning(false);
+  showToast('Stop requested — current step will finish.');
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendGoal();
+  }
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
+
+function setRunning(running) {
+  isRunning = running;
+  document.getElementById('run-btn').disabled = running;
+  document.getElementById('stop-btn').classList.toggle('visible', running);
+}
+
+function setGoal(el) {
+  const inp = document.getElementById('goal-input');
+  inp.value = el.textContent;
+  inp.focus();
+}
+
+/* ── Sidebar data ───────────────────────────────────────────────────────── */
+async function loadSidebar() {
+  try {
+    const [skills, mem, schedules, tools] = await Promise.all([
+      fetch('/api/skills').then(r => r.json()),
+      fetch('/api/memory').then(r => r.json()),
+      fetch('/api/schedules').then(r => r.json()),
+      fetch('/api/tools').then(r => r.json()),
+    ]);
+    renderStats(mem.stats);
+    renderSkills(skills.skills);
+    renderSchedules(schedules.jobs);
+    renderTools(tools.tools);
+  } catch(e) { console.warn('Sidebar load error:', e); }
+}
+
+function renderStats(s) {
+  document.getElementById('stat-sessions').textContent = s.total_sessions || 0;
+  document.getElementById('stat-savings').textContent = (s.avg_token_savings_pct || 0).toFixed(0) + '%';
+  document.getElementById('stat-s1').textContent = s.total_s1_steps || 0;
+  document.getElementById('stat-s2').textContent = s.total_s2_steps || 0;
+}
+
+function renderSkills(skills) {
+  const el = document.getElementById('skills-list');
+  if (!skills.length) {
+    el.innerHTML = '<div style="padding:8px 16px;color:var(--text-muted);font-size:12px;">No skills yet — complete a task to synthesize one.</div>';
+    return;
+  }
+  el.innerHTML = skills.slice(0, 8).map(s => `
+    <div class="sidebar-item">
+      <div class="item-icon">📚</div>
+      <div>
+        <div class="item-name">${escHtml(s.name)}</div>
+        <div class="item-sub">${escHtml((s.tool_sequence || []).join(' → '))}</div>
+      </div>
+      <div class="sidebar-count">${s.success_count}x</div>
+    </div>
+  `).join('');
+}
+
+function renderSchedules(jobs) {
+  const el = document.getElementById('schedules-list');
+  if (!jobs.length) {
+    el.innerHTML = '<div style="padding:8px 16px;color:var(--text-muted);font-size:12px;">No jobs scheduled.</div>';
+    return;
+  }
+  el.innerHTML = jobs.slice(0, 5).map(j => `
+    <div class="sidebar-item">
+      <div class="item-icon">${j.enabled ? '⏰' : '⏸'}</div>
+      <div>
+        <div class="item-name">${escHtml(j.description.slice(0, 30))}</div>
+        <div class="item-sub">${escHtml(j.cron_expr)} · ${j.run_count} runs</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function renderTools(tools) {
+  const el = document.getElementById('tools-list');
+  if (!tools.length) {
+    el.innerHTML = '<div style="padding:8px 16px;color:var(--text-muted);font-size:12px;">No tools registered.</div>';
+    return;
+  }
+  el.innerHTML = tools.map(t => {
+    const riskBadge = t.requires_approval
+      ? `<span class="badge badge-${t.risk_level === 'high' ? 'red' : 'yellow'}">${t.risk_level}</span>`
+      : '<span class="badge badge-green">safe</span>';
+    return `
+      <div class="sidebar-item">
+        <div class="item-icon">🔧</div>
+        <div style="flex:1;min-width:0">
+          <div class="item-name">${escHtml(t.name)}</div>
+          <div class="item-sub">${escHtml(t.description.slice(0, 48))}…</div>
+        </div>
+        <div>${riskBadge}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+/* ── Theme ──────────────────────────────────────────────────────────────── */
+function toggleTheme() {
+  const html = document.documentElement;
+  const next = html.dataset.theme === 'dark' ? 'light' : 'dark';
+  html.dataset.theme = next;
+  localStorage.setItem('theme', next);
+}
+(function initTheme() {
+  const saved = localStorage.getItem('theme');
+  if (saved) document.documentElement.dataset.theme = saved;
+})();
+
+/* ── Toast ──────────────────────────────────────────────────────────────── */
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3500);
+}
+
+/* ── Util ───────────────────────────────────────────────────────────────── */
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/* ── Boot ───────────────────────────────────────────────────────────────── */
+connect();
+</script>
+</body>
+</html>
