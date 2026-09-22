@@ -25,6 +25,9 @@ class AgentConfig(BaseModel):
     openai_api_key: Optional[str] = None
     hermes_base_url: str = "http://localhost:11434/v1"
     hermes_model: str = "nous-hermes-3-llama-3.1-8b"
+    # Needed for hosted OpenAI-compatible gateways (OmniRoute, OpenRouter, a
+    # remote vLLM). Local Ollama/vLLM needs no key, so this stays optional.
+    hermes_api_key: Optional[str] = None
     
     # User / workspace preferences
     auto_learn_skills: bool = True
@@ -118,7 +121,36 @@ def load_config() -> AgentConfig:
     if env_anthropic and not data.get("anthropic_api_key"):
         data["anthropic_api_key"] = env_anthropic
 
-    return AgentConfig(**data)
+    env_hermes = os.getenv("HERMES_API_KEY")
+    if env_hermes and not data.get("hermes_api_key"):
+        data["hermes_api_key"] = env_hermes
+    env_hermes_url = os.getenv("HERMES_BASE_URL")
+    if env_hermes_url:
+        data["hermes_base_url"] = env_hermes_url
+    env_hermes_model = os.getenv("HERMES_MODEL")
+    if env_hermes_model:
+        data["hermes_model"] = env_hermes_model
+
+    config = AgentConfig(**data)
+
+    # Export resolved provider settings back into the environment.
+    #
+    # The System 2 providers read os.environ directly (see system_two.py), so
+    # without this the values a user saves via `dual-agent config` were parsed,
+    # stored and then silently ignored — the provider kept using its defaults and
+    # usually fell back to the mock. Real environment variables still take
+    # precedence, so a shell export always overrides the config file.
+    _export_if_absent("HERMES_BASE_URL", config.hermes_base_url)
+    _export_if_absent("HERMES_MODEL", config.hermes_model)
+    _export_if_absent("HERMES_API_KEY", config.hermes_api_key)
+
+    return config
+
+
+def _export_if_absent(name: str, value: Optional[str]) -> None:
+    """Set an environment variable only if it is not already set and is truthy."""
+    if value and not os.environ.get(name):
+        os.environ[name] = value
 
 
 def save_config(config: AgentConfig) -> str:
@@ -174,6 +206,16 @@ def run_configuration_wizard() -> AgentConfig:
     elif provider == "hermes":
         url = Prompt.ask("Hermes Ollama/vLLM Base URL", default=current.hermes_base_url)
         current.hermes_base_url = url.strip()
+        model = Prompt.ask("Model name", default=current.hermes_model)
+        current.hermes_model = model.strip()
+        # Optional: only hosted gateways need this. Blank is correct for a local
+        # server, which is why it is not a required prompt.
+        key = Prompt.ask(
+            "API key (blank for a local server)",
+            default=current.hermes_api_key or "",
+            password=True,
+        )
+        current.hermes_api_key = key.strip()
 
     # 4. Save
     saved_path = save_config(current)

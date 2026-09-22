@@ -109,7 +109,12 @@ def test_system_two_provider_fallback():
 
     resp = provider.generate_step("Test prompt")
     assert resp.action in ("write_file", "finish_task")
-    assert resp.tokens_used > 0
+    # No model is called by the mock, so it must NOT report token usage — that
+    # number used to be a hardcoded 450, which made canned output look like real
+    # inference in the telemetry and in the session store.
+    assert resp.tokens_used == 0
+    assert resp.is_mock is True
+    assert resp.degraded_reason
     assert resp.latency_ms > 0
 
 

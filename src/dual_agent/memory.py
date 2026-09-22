@@ -93,6 +93,31 @@ class MemoryEngine:
                 END
             """)
 
+            # Trigger to keep FTS in sync with sessions DELETES.
+            #
+            # WHY THIS EXISTS: sessions_fts is an *external-content* FTS5 table
+            # (content='sessions'), so it owns a shadow index that SQLite does
+            # NOT maintain automatically when a row disappears from `sessions`.
+            # Without this trigger, DELETE FROM sessions leaves the FTS entry
+            # behind forever: full_text_search still MATCHes the deleted text and
+            # the JOIN back to `sessions` silently drops the row, so the index
+            # grows without bound and reports hits for sessions that no longer
+            # exist (or, worse, resurrects a recycled rowid's text under a brand
+            # new session). Retention (prune_sessions) is the natural deleter
+            # here, which is exactly why the missing trigger went unnoticed.
+            #
+            # The FTS5 external-content delete protocol requires the *old*
+            # (deleted) values be handed back as an 'delete' row, and `old.id`
+            # must be passed as a rowid so the shadow term entries are removed.
+            # CREATE TRIGGER IF NOT EXISTS keeps this idempotent so databases
+            # created by older versions (which only got sessions_ai) pick it up.
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
+                    INSERT INTO sessions_fts(sessions_fts, rowid, goal, outcome)
+                    VALUES ('delete', old.id, old.goal, COALESCE(old.outcome, ''));
+                END
+            """)
+
             # Learned skills table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS learned_skills (
@@ -319,6 +344,154 @@ class MemoryEngine:
                 "total_tokens": 0,
                 "avg_token_savings_pct": None,
             }
+
+    # ------------------------------------------------------------------
+    # Retention, WAL maintenance, and FTS index integrity
+    # ------------------------------------------------------------------
+
+    def prune_sessions(
+        self,
+        keep_last: Optional[int] = None,
+        older_than_days: Optional[float] = None,
+        dry_run: bool = True,
+    ) -> Dict[str, Any]:
+        """Delete old session rows so the store does not grow without bound.
+
+        Retention policy: exactly one of the two criteria must be supplied.
+
+          * ``keep_last=N``        — keep the N most recent sessions (by id),
+                                     match everything older.
+          * ``older_than_days=D``  — match sessions created more than D days
+                                     ago (created_at is the SQLite CURRENT_TIMESTAMP
+                                     string, so comparison is done with SQLite's
+                                     own datetime() to avoid format drift).
+
+        When BOTH are supplied they are ANDed: a session is matched only if it
+        is outside the newest ``keep_last`` rows *and* older than the cutoff.
+
+        SAFE BY DEFAULT: ``dry_run=True`` reports what WOULD be deleted and
+        removes nothing. Callers must opt in to destruction explicitly.
+
+        The FTS5 index is repaired as part of the delete path (see the
+        sessions_ad trigger and rebuild_fts_index) so callers never have to
+        remember a second "and now fix the index" step: after this returns,
+        ``full_text_search`` cannot surface a session that was just pruned.
+
+        Returns a dict with ``matched`` (rows qualifying), ``deleted`` (rows
+        actually removed — always 0 on a dry run), ``retained`` (rows left in
+        the table), ``dry_run``, and ``keep_last`` / ``older_than_days``.
+        """
+        if keep_last is None and older_than_days is None:
+            raise ValueError(
+                "prune_sessions requires keep_last and/or older_than_days; "
+                "refusing to run with no retention criterion (that would mean "
+                "'delete everything')."
+            )
+        if keep_last is not None and keep_last < 0:
+            raise ValueError(f"keep_last must be >= 0, got {keep_last!r}")
+        if older_than_days is not None and older_than_days < 0:
+            raise ValueError(
+                f"older_than_days must be >= 0, got {older_than_days!r}"
+            )
+
+        where_parts: List[str] = []
+        params: List[Any] = []
+
+        if keep_last is not None:
+            # Everything strictly older (lower id) than the Nth newest row.
+            where_parts.append(
+                "id NOT IN (SELECT id FROM sessions ORDER BY id DESC LIMIT ?)"
+            )
+            params.append(int(keep_last))
+
+        if older_than_days is not None:
+            where_parts.append(
+                "datetime(created_at) < datetime('now', ?)"
+            )
+            # e.g. '-7 days' — datetime('now', '-7.0 days') is accepted too.
+            params.append(f"-{float(older_than_days)} days")
+
+        where_sql = " AND ".join(f"({p})" for p in where_parts)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT COUNT(*) FROM sessions WHERE {where_sql}", params)
+            matched = cursor.fetchone()[0] or 0
+
+            deleted = 0
+            if not dry_run and matched:
+                # The sessions_ad trigger removes the matching FTS entries as
+                # each row goes, so no orphans are created by this delete.
+                cursor.execute(f"DELETE FROM sessions WHERE {where_sql}", params)
+                deleted = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else matched
+                conn.commit()
+
+            cursor.execute("SELECT COUNT(*) FROM sessions")
+            retained = cursor.fetchone()[0] or 0
+
+        if not dry_run and deleted:
+            # Belt and braces: the trigger handles the rows deleted above, but
+            # databases that were written to by a pre-trigger version may carry
+            # pre-existing orphans. Rebuilding here means prune_sessions alone
+            # is sufficient to leave the index consistent — the caller never
+            # has to know rebuild_fts_index exists.
+            self.rebuild_fts_index()
+
+        return {
+            "matched": matched,
+            "deleted": deleted,
+            "retained": retained,
+            "dry_run": dry_run,
+            "keep_last": keep_last,
+            "older_than_days": older_than_days,
+        }
+
+    def checkpoint_wal(self) -> Dict[str, Any]:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` so the -wal file is reclaimed.
+
+        In WAL mode the database appends to ``<db>-wal`` and only folds pages
+        back into the main file at a checkpoint. With a single short-lived
+        writer that never checkpoints, the -wal file grows with every run (2.4MB
+        observed on a 151KB database). TRUNCATE checkpoints *and* shrinks the
+        WAL back to zero bytes.
+
+        Returns a dict with the three PRAGMA result counters:
+          * ``busy``        — 1 if the checkpoint could not complete (another
+                              connection held the WAL write lock), else 0.
+          * ``log``         — total number of pages in the WAL log.
+          * ``checkpointed``— number of pages moved back into the database.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+
+        if row is None:
+            return {"busy": None, "log": None, "checkpointed": None}
+
+        return {
+            "busy": row[0],
+            "log": row[1],
+            "checkpointed": row[2],
+        }
+
+    def rebuild_fts_index(self) -> int:
+        """Rebuild the sessions_fts index from the sessions table.
+
+        ``INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')`` is FTS5's
+        documented repair command: it discards the shadow index and re-derives
+        it from the content table. This is what fixes an index that already
+        accumulated orphans (deleted sessions whose FTS entries were never
+        removed because no AFTER DELETE trigger existed), and it also clears
+        duplicate/stale term entries left by repeated writes.
+
+        Returns the number of session rows now represented in the index.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')")
+            conn.commit()
+            cursor.execute("SELECT COUNT(*) FROM sessions")
+            return cursor.fetchone()[0] or 0
 
     # ------------------------------------------------------------------
     # FTS5 Full-Text Search (Hermes-style cross-session recall)

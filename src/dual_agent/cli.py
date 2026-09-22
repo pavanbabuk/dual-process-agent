@@ -88,6 +88,22 @@ def run_agent_task(
             )
         )
 
+    if result.system_two_is_mock:
+        console.print(
+            Panel(
+                "[bold yellow]⚠ System 2 used the MOCK provider — nothing was generated.[/bold yellow]\n"
+                f"Reason: {result.system_two_degraded_reason}\n"
+                "The 'result' above is canned text from a stub, not model output.\n"
+                "Configure a real model, e.g.:\n"
+                "  SYSTEM_TWO_PROVIDER=hermes\n"
+                "  HERMES_BASE_URL=http://localhost:20128/v1\n"
+                "  HERMES_API_KEY=<key>\n"
+                "  HERMES_MODEL=auto/cheap",
+                border_style="yellow",
+                box=box.ROUNDED,
+            )
+        )
+
     # A real savings/speedup figure requires running the same goal through a
     # plain single-model agent loop and comparing. Not implemented yet, so we
     # say so instead of printing an invented percentage.

@@ -21,6 +21,25 @@ class SystemTwoResponse(BaseModel):
     generated_content: Optional[str] = None
     latency_ms: float = 0.0
     tokens_used: int = 0
+    # True when this came from MockSystemTwoProvider instead of a real model.
+    # Callers MUST surface this. Canned text presented as model output is the
+    # same failure mode as a fabricated benchmark: the run looks successful and
+    # nothing was actually generated.
+    is_mock: bool = False
+    # Why a real model was not used (unset while a real model answered).
+    degraded_reason: Optional[str] = None
+
+
+def _mock_fallback(prompt: str, reason: str) -> "SystemTwoResponse":
+    """Return a Mock response, labelled with the reason the real call failed.
+
+    Centralised so every failure path reports WHY it degraded instead of
+    silently returning canned content that a caller cannot distinguish from a
+    real generation.
+    """
+    response = MockSystemTwoProvider().generate_step(prompt)
+    response.degraded_reason = reason
+    return response
 
 
 class SystemTwoProvider(ABC):
@@ -59,29 +78,53 @@ class MockSystemTwoProvider(SystemTwoProvider):
             args=args,
             generated_content=content,
             latency_ms=elapsed_ms,
-            tokens_used=450,
+            # No model was called, so no tokens were consumed. This previously
+            # reported a hardcoded 450, which made mock runs look like real
+            # inference in the telemetry and in the session store.
+            tokens_used=0,
+            is_mock=True,
+            degraded_reason="mock provider — no real model was called",
         )
 
 
 class HermesProvider(SystemTwoProvider):
-    """Nous Research Hermes 3 provider via local Ollama or vLLM."""
+    """Nous Research Hermes 3, or any OpenAI-compatible chat endpoint.
+
+    Used for both a local Ollama/vLLM server (no auth) and hosted
+    OpenAI-compatible gateways such as OmniRoute (bearer auth). The API key is
+    optional because local servers do not need one, but it MUST be sent when
+    present: without an Authorization header this provider could not talk to any
+    authenticated endpoint at all, which is why the agent appeared to have a
+    working System 2 while actually only ever reaching the mock.
+    """
 
     def __init__(
         self,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
-        timeout: float = 30.0,
+        api_key: Optional[str] = None,
+        timeout: Optional[float] = None,
     ):
         self.base_url = base_url or os.getenv("HERMES_BASE_URL", "http://localhost:11434/v1")
         self.model = model or os.getenv("HERMES_MODEL", "nous-hermes-3-llama-3.1-8b")
-        self.timeout = timeout
+        self.api_key = api_key or os.getenv("HERMES_API_KEY", "")
+        # Hosted gateways are slower than a local model, and a free gateway can
+        # hang on a struggling upstream provider. 30s was tight enough that real
+        # calls timed out and silently degraded to the mock; 60s was long enough
+        # to stall an agent step for a minute. Tunable because the right value
+        # depends entirely on where the endpoint lives.
+        self.timeout = timeout or float(os.getenv("SYSTEM_TWO_TIMEOUT", "45"))
 
     def generate_step(self, prompt: str) -> SystemTwoResponse:
         start = time.perf_counter()
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         try:
             with httpx.Client(timeout=self.timeout) as client:
                 res = client.post(
                     f"{self.base_url.rstrip('/')}/chat/completions",
+                    headers=headers,
                     json={
                         "model": self.model,
                         "messages": [
@@ -89,6 +132,12 @@ class HermesProvider(SystemTwoProvider):
                             {"role": "user", "content": prompt},
                         ],
                         "response_format": {"type": "json_object"},
+                        # Bounded so a struggling upstream provider cannot hang a
+                        # step until the socket timeout. Must be generous enough
+                        # for a write_file call, whose `content` argument is a
+                        # whole file: at 700 tokens the JSON came back truncated
+                        # mid-string and failed to parse.
+                        "max_tokens": int(os.getenv("SYSTEM_TWO_MAX_TOKENS", "4000")),
                     },
                 )
                 res.raise_for_status()
@@ -97,7 +146,7 @@ class HermesProvider(SystemTwoProvider):
 
                 raw_content = data["choices"][0]["message"]["content"]
                 parsed = json.loads(raw_content)
-                tokens = data.get("usage", {}).get("total_tokens", 500)
+                tokens = data.get("usage", {}).get("total_tokens", 0)
 
                 return SystemTwoResponse(
                     thought=parsed.get("thought", "Executed reasoning."),
@@ -108,9 +157,9 @@ class HermesProvider(SystemTwoProvider):
                     tokens_used=tokens,
                 )
         except Exception as e:
-            logger.warning(f"Hermes provider failed ({e}). Falling back to mock response.")
-            mock = MockSystemTwoProvider()
-            return mock.generate_step(prompt)
+            reason = f"System 2 call to {self.base_url} failed: {type(e).__name__}: {e}"
+            logger.warning(f"{reason} — falling back to mock response.")
+            return _mock_fallback(prompt, reason)
 
 
 class OpenAICompatibleProvider(SystemTwoProvider):
@@ -121,18 +170,28 @@ class OpenAICompatibleProvider(SystemTwoProvider):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
-        timeout: float = 30.0,
+        timeout: Optional[float] = None,
     ):
-        self.api_key = api_key or os.getenv("GROK_API_KEY") or os.getenv("OPENAI_API_KEY", "")
-        self.base_url = base_url or os.getenv("OPENAI_BASE_URL", "https://api.x.ai/v1" if "GROK" in os.environ else "https://api.openai.com/v1")
-        self.model = model or os.getenv("GROK_MODEL", "grok-2-latest" if "GROK" in os.environ else "gpt-4o")
-        self.timeout = timeout
+        # Resolution is explicit per vendor. The previous version keyed off
+        # whether the string "GROK" happened to be anywhere in os.environ and
+        # then read GROK_MODEL even in OpenAI mode, so setting OPENAI_MODEL had
+        # no effect and an unrelated env var could silently change the model.
+        if "x.ai" in (base_url or os.getenv("OPENAI_BASE_URL", "")) or os.getenv("GROK_API_KEY"):
+            self.api_key = api_key or os.getenv("GROK_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+            self.base_url = base_url or os.getenv("GROK_BASE_URL", "https://api.x.ai/v1")
+            self.model = model or os.getenv("GROK_MODEL", "grok-2-latest")
+        else:
+            self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
+            self.base_url = base_url or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+            self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o")
+        self.timeout = timeout or float(os.getenv("SYSTEM_TWO_TIMEOUT", "45"))
 
     def generate_step(self, prompt: str) -> SystemTwoResponse:
         start = time.perf_counter()
         if not self.api_key:
-            logger.warning("No API key found for OpenAICompatibleProvider. Falling back to mock.")
-            return MockSystemTwoProvider().generate_step(prompt)
+            reason = f"no API key configured for {self.base_url}"
+            logger.warning(f"{reason} — falling back to mock.")
+            return _mock_fallback(prompt, reason)
 
         try:
             with httpx.Client(timeout=self.timeout) as client:
@@ -146,6 +205,7 @@ class OpenAICompatibleProvider(SystemTwoProvider):
                             {"role": "user", "content": prompt},
                         ],
                         "response_format": {"type": "json_object"},
+                        "max_tokens": int(os.getenv("SYSTEM_TWO_MAX_TOKENS", "4000")),
                     },
                 )
                 res.raise_for_status()
@@ -154,7 +214,7 @@ class OpenAICompatibleProvider(SystemTwoProvider):
 
                 raw = data["choices"][0]["message"]["content"]
                 parsed = json.loads(raw)
-                tokens = data.get("usage", {}).get("total_tokens", 450)
+                tokens = data.get("usage", {}).get("total_tokens", 0)
 
                 return SystemTwoResponse(
                     thought=parsed.get("thought", "Completed deliberate reasoning."),
@@ -165,15 +225,16 @@ class OpenAICompatibleProvider(SystemTwoProvider):
                     tokens_used=tokens,
                 )
         except Exception as e:
-            logger.warning(f"System 2 API call failed: {e}. Falling back to mock.")
-            return MockSystemTwoProvider().generate_step(prompt)
+            reason = f"System 2 call to {self.base_url} failed: {type(e).__name__}: {e}"
+            logger.warning(f"{reason} — falling back to mock.")
+            return _mock_fallback(prompt, reason)
 
 
 def get_system_two_provider(provider_type: Optional[str] = None) -> SystemTwoProvider:
     """Factory function to resolve configured System 2 provider."""
     ptype = (provider_type or os.getenv("SYSTEM_TWO_PROVIDER", "mock")).lower()
-    
-    if ptype in ("hermes", "hermes_ollama", "ollama"):
+
+    if ptype in ("hermes", "hermes_ollama", "ollama", "omniroute", "local"):
         return HermesProvider()
     elif ptype in ("grok", "xai"):
         return OpenAICompatibleProvider(
@@ -184,4 +245,9 @@ def get_system_two_provider(provider_type: Optional[str] = None) -> SystemTwoPro
     elif ptype in ("openai", "gpt"):
         return OpenAICompatibleProvider()
     else:
+        if ptype != "mock":
+            logger.warning(
+                f"Unknown SYSTEM_TWO_PROVIDER {ptype!r}; using the mock provider. "
+                "The mock returns canned text and cannot generate anything real."
+            )
         return MockSystemTwoProvider()

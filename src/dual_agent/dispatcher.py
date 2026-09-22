@@ -77,6 +77,12 @@ class DispatchResult(BaseModel):
     # Jev roundtrip sleeps). Excluded from nothing — reported so the number
     # cannot be mistaken for real model latency.
     simulated_latency_ms: float = 0.0
+    # True when System 2 fell back to the mock provider, so the "generated"
+    # content is canned text rather than model output. Surfaced because a run
+    # that reports success while generating nothing is the failure mode this
+    # codebase has already been burned by (fabricated benchmark columns).
+    system_two_is_mock: bool = False
+    system_two_degraded_reason: Optional[str] = None
 
 
 class DualProcessDispatcher:
@@ -150,6 +156,8 @@ class DualProcessDispatcher:
         s1_latency_total = 0.0
         s2_latency_total = 0.0
         simulated_s1_latency = 0.0
+        s2_is_mock = False
+        s2_degraded_reason: Optional[str] = None
 
         # Stall detection. A goal the router cannot terminate on (e.g. one whose
         # text never satisfies the terminal check) used to spin until max_steps,
@@ -320,6 +328,9 @@ class DualProcessDispatcher:
                 )
                 s2_response = self.s2.generate_step(s2_prompt)
                 s2_latency_total += s2_response.latency_ms
+                if s2_response.is_mock:
+                    s2_is_mock = True
+                    s2_degraded_reason = s2_response.degraded_reason
 
                 if s2_response.action == "finish_task":
                     state.is_completed = True
@@ -496,6 +507,8 @@ class DualProcessDispatcher:
             used_simulated_system_one=bool(getattr(self.s1, "force_simulation", False)),
             system_one_fallback_reason=getattr(self.s1, "simulation_reason", None) or None,
             simulated_latency_ms=round(simulated_s1_latency, 3),
+            system_two_is_mock=s2_is_mock,
+            system_two_degraded_reason=s2_degraded_reason,
         )
 
     def _check_fast_path_confidence(

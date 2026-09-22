@@ -159,6 +159,11 @@ class GatewayRunner:
                 f"⚠️ Router was SIMULATED ({result.system_one_fallback_reason}) — "
                 "not the Jev model."
             )
+        if result.system_two_is_mock:
+            lines.append(
+                f"⚠️ System 2 used the MOCK provider ({result.system_two_degraded_reason}) — "
+                "the text above is canned, not generated."
+            )
         return "\n".join(lines)
 
     async def send(self, chat_id: str, text: str) -> None:
