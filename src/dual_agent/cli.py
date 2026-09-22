@@ -116,7 +116,68 @@ def run_agent_task(
     console.print(f"\n{status_icon} [bold]Outcome:[/bold] {result.final_output or 'Task completed.'}\n")
 
 
+UNIFIED_HELP = """Dual-Process Agent — routes each step with Jev (System 1) and escalates to a
+model (System 2) only when the fast path is not confident enough.
+
+USAGE
+  dual-agent                                    Interactive shell (no arguments)
+  dual-agent --goal "..." [options]             Run one goal
+  dual-agent "..." [options]                    Run one goal (positional form)
+  dual-agent ui [--port=7860] [--no-browser]    Web dashboard (loopback only)
+  dual-agent gateway [--max-steps=N]            Telegram bot + cron scheduler daemon
+  dual-agent config                             Configuration wizard
+  dual-agent update                             Self-update from git
+
+OPTIONS for a single goal
+  --goal TEXT                Goal to achieve
+  --provider NAME            System 2 provider: mock | hermes | grok | openai
+  --threshold FLOAT          System 1 confidence needed to trust the fast path
+  --max-steps INT            Step budget (default 10)
+
+ENVIRONMENT
+  DUAL_AGENT_HOME                 Data dir. Default ~/.dual_agent.
+  TYPESAFE_API_KEY                Enables live Jev routing. Without it System 1
+                                  is a local stub and every run says so.
+  TYPESAFE_BASE_URL               Default https://api.typesafe.ai
+
+  SYSTEM_TWO_PROVIDER             mock | hermes | grok | openai (default mock).
+  HERMES_BASE_URL                 OpenAI-compatible System 2 endpoint.
+  HERMES_API_KEY                  Bearer token for that endpoint.
+  HERMES_MODEL                    Model name.
+  OPENAI_API_KEY / OPENAI_MODEL / OPENAI_BASE_URL
+  GROK_API_KEY / GROK_MODEL
+  SYSTEM_TWO_TIMEOUT              Seconds (default 45).
+  SYSTEM_TWO_MAX_TOKENS           Generation cap (default 4000).
+
+  DUAL_AGENT_AUTO_ALLOW_PERMISSIONS=true   Skip approval prompts. Required for
+                                           unattended use (gateway), where there
+                                           is no terminal to answer them.
+  DUAL_AGENT_UI_FORCE_SIMULATION=true      Keep the dashboard on the offline stub.
+  DUAL_AGENT_UI_ALLOW_PUBLIC_BIND=true     Allow a non-loopback dashboard bind.
+  TELEGRAM_BOT_TOKEN                       Required by `gateway`.
+  TELEGRAM_ALLOWED_USER_IDS                Required by `gateway`. Comma-separated
+                                           numeric ids; everyone else is refused.
+
+QUICK START
+  dual-agent config                 # set keys, saved to ~/.dual_agent/config.json
+  dual-agent --goal "list the files in this directory"
+
+The free path: point System 2 at a local OpenAI-compatible server (Ollama, vLLM,
+LM Studio, OmniRoute) instead of a paid API:
+  SYSTEM_TWO_PROVIDER=hermes HERMES_BASE_URL=http://localhost:20128/v1 \\
+  HERMES_MODEL=auto/cheap dual-agent --goal "..."
+"""
+
+
 def main():
+    # `main()` dispatches on the first argument before argparse runs, so the
+    # argparse help could only ever show the single-goal flags. `dual-agent
+    # --help` therefore never mentioned ui, gateway, config or update — half the
+    # interface was invisible to the one command everyone types first.
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ("-h", "--help", "help"):
+        console.print(UNIFIED_HELP)
+        return
+
     # If no arguments provided, launch interactive conversational shell
     if len(sys.argv) == 1:
         from dual_agent.shell import InteractiveShell
@@ -181,7 +242,15 @@ def main():
             raise SystemExit(2)
         return
 
-    parser = argparse.ArgumentParser(description="Run Dual-Process Agent with Jev and MCP.")
+    parser = argparse.ArgumentParser(
+        description="Run Dual-Process Agent with Jev and MCP.",
+        epilog=(
+            "Other entry points (handled before this parser, so they are not listed "
+            "above): ui [--port=N] [--no-browser], gateway [--max-steps=N], config, "
+            "update. Run 'dual-agent --help' for the full interface and environment "
+            "variables."
+        ),
+    )
     parser.add_argument(
         "positional_goal",
         nargs="?",
@@ -198,7 +267,7 @@ def main():
         "--provider",
         type=str,
         default=None,
-        choices=["mock", "hermes", "grok", "anthropic", "openai"],
+        choices=["mock", "hermes", "grok", "openai"],
         help="System 2 model provider.",
     )
     parser.add_argument(
