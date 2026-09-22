@@ -41,14 +41,16 @@ all = [
 [project.scripts]
 dual-agent = "dual_agent.cli:main"
 
+# `bridges` is a top-level package at the repo root, not under src/, so it needs
+# its own package-dir mapping. Without that override, the "" = "src" mapping
+# applies to every package and setuptools looks for src/bridges, which does not
+# exist — that failed the build outright. Previously `bridges` was simply not
+# listed, so it was never installed and `import bridges` worked only because a
+# stale editable checkout was on sys.path via a leftover .pth file.
 [tool.setuptools.package-dir]
 "" = "src"
+bridges = "bridges"
 
-# `bridges` is a top-level package at the repo root, not under src/. It is
-# imported at runtime (tests and the Hermes middleware bridge), but the previous
-# config declared src as the only package root WITHOUT listing `bridges`, so it
-# was never actually installed — `import bridges` only worked because a stale
-# editable checkout happened to be on sys.path via a leftover .pth file.
 [tool.setuptools.packages.find]
 where = ["src", "."]
 include = ["dual_agent*", "bridges*"]

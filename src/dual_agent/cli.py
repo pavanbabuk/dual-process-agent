@@ -137,6 +137,34 @@ def main():
         run_server(host="localhost", port=port, open_browser=not no_browser)
         return
 
+    # Messaging gateway (Telegram) + scheduler daemon.
+    # These were documented in the README, install.sh, the shell help and the
+    # scheduler docstring, but had no handler here — so `dual-agent --gateway`
+    # died with "unrecognized arguments", leaving the gateway package and all
+    # scheduled jobs unreachable.
+    if sys.argv[1].lower() in ("--gateway", "gateway", "--daemon", "daemon"):
+        max_steps = 10
+        for arg in sys.argv[2:]:
+            if arg.startswith("--max-steps="):
+                try:
+                    max_steps = int(arg.split("=", 1)[1])
+                except ValueError:
+                    pass
+        from dual_agent.gateway.runner import run_gateway
+        try:
+            run_gateway(max_steps=max_steps)
+        except ImportError as e:
+            console.print(
+                f"[bold red]Gateway dependencies missing.[/bold red]\n{e}\n"
+                "[dim]Install with:  pip install 'dual-agent[gateway]'[/dim]"
+            )
+            raise SystemExit(1)
+        except ValueError as e:
+            # Configuration problems (missing token) are user errors, not crashes.
+            console.print(f"[bold red]Gateway not started.[/bold red]\n{e}")
+            raise SystemExit(2)
+        return
+
     parser = argparse.ArgumentParser(description="Run Dual-Process Agent with Jev and MCP.")
     parser.add_argument(
         "positional_goal",

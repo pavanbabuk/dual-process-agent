@@ -157,7 +157,13 @@ dual-agent --gateway
 
 The gateway routes each Telegram chat to an isolated agent session with separate memory.
 
+Running the gateway also starts the **scheduler daemon**, which is what actually fires `/schedule` jobs — they do not run while only the shell or dashboard is open.
+
 **Authorization is required.** The bot can write files and run shell commands on the machine hosting it, so it will only accept messages from ids listed in `TELEGRAM_ALLOWED_USER_IDS`. With that list empty, **every** message is rejected — the default is closed, not open. Set it before starting the daemon, and never leave a shell-capable bot reachable by whoever happens to find it.
+
+**Risky tools are denied in gateway mode** unless you set `DUAL_AGENT_AUTO_ALLOW_PERMISSIONS=true`. There is no terminal behind a chat to answer an approval card, so `write_file` and `run_shell_command` are refused rather than permitted silently.
+
+Configuration is read from `.env` (checked at `~/.dual_agent/.env` and `./.env`); real environment variables take precedence over the file.
 
 ---
 
@@ -215,4 +221,4 @@ ID  Description                           Cron        Runs  Last Run  Enabled
 pytest -v --cov=dual_agent --cov=bridges
 ```
 
-**107 passing** unit and integration tests covering all modules — including regression tests for argument validation, shell-injection resistance, gateway authorization, and the telemetry-honesty guarantees described above.
+**121 passing** unit and integration tests on Python 3.11 and 3.14 — including regression tests for argument validation, shell-injection resistance, gateway authorization, telemetry honesty, `.env` loading, and stall detection.

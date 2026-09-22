@@ -37,14 +37,24 @@ class ApprovalDecision(str, Enum):
 class PermissionBroker:
     """Intercepts risky tool calls and requests user approval via Rich cards."""
 
-    def __init__(self, memory_engine=None, auto_allow: bool = False):
+    def __init__(
+        self,
+        memory_engine=None,
+        auto_allow: bool = False,
+        non_interactive: bool = False,
+    ):
         """
         Args:
             memory_engine: Optional MemoryEngine for audit logging.
             auto_allow:    If True, all requests are auto-approved (useful for CI/testing).
+            non_interactive: No terminal exists to answer a prompt — e.g. the
+                           Telegram gateway, where the agent runs server-side.
+                           An approval request is then DENIED instead of
+                           blocking on stdin or raising EOFError.
         """
         self.memory = memory_engine
         self.auto_allow = auto_allow
+        self.non_interactive = non_interactive
         # Tool names allowed for the entire session (ALLOW_SESSION decisions)
         self._session_allowed: Set[str] = set()
         # Tool names denied for the entire session
@@ -73,6 +83,19 @@ class PermissionBroker:
         # --- Auto-allow mode (CI / tests) ---
         if self.auto_allow:
             return ApprovalDecision.ALLOW_ONCE, args
+
+        # --- No terminal available (gateway/web server) ---
+        # Prompt.ask below would block on stdin or raise EOFError, so an
+        # unanswerable approval is denied instead of hanging the daemon.
+        if self.non_interactive:
+            logger.warning(
+                f"[PermissionBroker] DENIED '{tool_name}' ({risk_level} risk): no "
+                "interactive terminal to approve it. Set "
+                "DUAL_AGENT_AUTO_ALLOW_PERMISSIONS=true to allow risky tools "
+                "unattended in gateway mode."
+            )
+            self._log_decision(tool_name, args, ApprovalDecision.DENY)
+            return ApprovalDecision.DENY, args
 
         # --- Render the approval card ---
         risk_color = {

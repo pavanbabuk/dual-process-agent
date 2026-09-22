@@ -151,6 +151,15 @@ class DualProcessDispatcher:
         s2_latency_total = 0.0
         simulated_s1_latency = 0.0
 
+        # Stall detection. A goal the router cannot terminate on (e.g. one whose
+        # text never satisfies the terminal check) used to spin until max_steps,
+        # repeating the same tool with the same arguments and the same output.
+        # In live mode each of those steps is a paid Jev call, so a stuck loop
+        # costs real money to produce nothing. Three consecutive no-progress
+        # steps end the run instead.
+        last_signature = None
+        repeat_count = 0
+
         # Surface simulation mode up front rather than only in logs — a run whose
         # "System 1" is the local stub must never be reported as a Jev run.
         if getattr(self.s1, "force_simulation", False):
@@ -197,6 +206,10 @@ class DualProcessDispatcher:
                 break
 
             # --- ROUTING DECISION: Fast-path (System 1) vs Slow-path (System 2) ---
+            # Assigned only on the fast path; pre-declared so a rejected fast path
+            # can never leave them unbound.
+            tool_name: str = ""
+            default_args: Dict[str, Any] = {}
             fast_path_confidence = self._compute_fast_path_confidence(decision, state)
 
             can_use_fast_path = (
@@ -277,6 +290,22 @@ class DualProcessDispatcher:
                         metadata={"simulated": decision.simulated},
                     )
                 )
+
+                signature = (tool_name, repr(default_args), str(output_val)[:200])
+                repeat_count = repeat_count + 1 if signature == last_signature else 1
+                last_signature = signature
+                if repeat_count >= 3:
+                    state.is_completed = True
+                    state.final_output = (
+                        f"Stopped after {repeat_count} identical "
+                        f"'{tool_name}' steps with no change in output — the goal "
+                        "is not progressing. Nothing further is being attempted."
+                    )
+                    logger.warning(
+                        f"[Dispatcher] Stalled on repeated '{tool_name}' "
+                        f"({repeat_count}x identical output); ending run early."
+                    )
+                    break
             else:
                 # SLOW PATH: Escalate to System 2 (Hermes, Grok, Claude)
                 # Inject recall context and skill context into the prompt

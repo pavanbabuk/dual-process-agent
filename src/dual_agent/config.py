@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 from dual_agent.memory import get_default_data_dir
 
@@ -35,8 +35,58 @@ def get_config_file_path() -> str:
     return os.path.join(get_default_data_dir(), "config.json")
 
 
+def _candidate_env_files() -> List[str]:
+    """Paths that may hold a `.env`, in increasing order of precedence."""
+    return [
+        os.path.join(os.getcwd(), ".env"),          # repo-local (development)
+        os.path.join(get_default_data_dir(), ".env"),  # ~/.dual_agent/.env (installed)
+    ]
+
+
+def load_env_files() -> List[str]:
+    """Load KEY=VALUE pairs from `.env` files into os.environ.
+
+    The README and install.sh both instruct users to put credentials in a `.env`
+    file, but nothing ever read one — no dotenv dependency, no parser. Following
+    the documented setup silently left the agent in simulation mode with no
+    error and no warning, so it looked like it worked while never contacting
+    Jev at all.
+
+    Real environment variables always win: an exported key is never clobbered by
+    a stale file, so `TYPESAFE_API_KEY=... dual-agent` still overrides .env.
+    """
+    loaded: List[str] = []
+    for path in _candidate_env_files():
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    key = key.strip()
+                    # Strip surrounding quotes and trailing inline comments.
+                    value = value.strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                        value = value[1:-1]
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+            loaded.append(path)
+        except Exception as e:
+            logger.warning(f"Could not read env file {path}: {e}")
+    if loaded:
+        logger.debug(f"Loaded environment from: {', '.join(loaded)}")
+    return loaded
+
+
 def load_config() -> AgentConfig:
     """Loads configuration from ~/.dual_agent/config.json, with fallback to environment variables."""
+    # Read .env first: it is the setup path the docs describe, and without this
+    # the documented flow silently configures nothing.
+    load_env_files()
+
     cfg_path = get_config_file_path()
     data: Dict[str, Any] = {}
 

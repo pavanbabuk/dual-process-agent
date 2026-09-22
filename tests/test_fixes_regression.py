@@ -210,6 +210,9 @@ def test_telegram_adapter_parses_allowlist(monkeypatch):
 def test_dashboard_refuses_non_loopback_bind(monkeypatch):
     from dual_agent.web import server as web_server
 
+    if not web_server._FASTAPI_AVAILABLE:
+        pytest.skip("dashboard extras not installed (pip install 'dual-agent[ui]')")
+
     monkeypatch.delenv("DUAL_AGENT_UI_ALLOW_PUBLIC_BIND", raising=False)
     with pytest.raises(SystemExit) as exc:
         web_server.run_server(host="0.0.0.0", port=7860, open_browser=False)
